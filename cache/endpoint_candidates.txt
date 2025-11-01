@@ -1,0 +1,29 @@
+Total URLs: 22
+Interesting URLs: 15
+
+Top 60 interesting URLs:
+https://api.blablalink.com
+https://common-web.intlgame.com/sdk-cdn/account-api/latest/index.umd.js
+https://na-report.playerinfinite.com/api
+https://pre-api.blablalink.com
+https://sg-tools-cdn.blablalink.com
+https://test-api.blablalink.com
+https://www.blablalink.com/assets/nikke/version/default
+https://www.blablalink.com/assets/nikke/version/default/
+https://www.blablalink.com/assets/nikke/version/default/assets/banner-cn-C_08Yq9h.png
+https://www.blablalink.com/assets/nikke/version/default/assets/banner-en-B9ZDJYZT.png
+https://www.blablalink.com/assets/nikke/version/default/assets/banner-jp-BVDkTOUF.png
+https://www.blablalink.com/assets/nikke/version/default/assets/banner-kr-lDxkcN7M.png
+https://www.blablalink.com/assets/nikke/version/default/assets/banner-tw-DMG2CxNF.png
+https://www.blablalink.com/assets/nikke/version/default/assets/icon-ellipse-XO7ZPQYO.png
+https://www.blablalink.com/assets/nikke/version/default/assets/ot-persistent-cookie-icon-D1bATZps.png
+
+Pattern locations:
+openid: 20 hits; first positions: [19110, 24908, 30378, 118103, 118176]
+nikke: 20 hits; first positions: [3182, 16043, 16053, 28358, 30395]
+nikke-list: 8 hits; first positions: [32487, 32536, 32589, 32649, 44017]
+type=: 7 hits; first positions: [1303, 30307, 30326, 59227, 59306]
+combat: 3 hits; first positions: [147093, 182798, 182812]
+union: 16 hits; first positions: [7455, 31923, 32428, 35341, 44419]
+alliance: 0 hits; first positions: []
+guild: 3 hits; first positions: [147866, 147879, 147885]

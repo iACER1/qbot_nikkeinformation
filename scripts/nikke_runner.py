@@ -3,27 +3,23 @@
 """
 Nikke 统一主程序（插件内脚本）
 
-迁移说明：
-- 本脚本与其依赖的 nikke_top_codes.py / nikke_api.py 已被移动到插件目录：
-  /AstrBot/data/plugins/qbot_nikkeinformation/scripts
-- 所有输出产物统一写入插件目录下：
-  /AstrBot/data/plugins/qbot_nikkeinformation/storage
-- 默认 Cookie 文件为插件目录下：
-  /AstrBot/data/plugins/qbot_nikkeinformation/.nikke_auth/cookie.txt
-  你也可以通过 --cookie-file 或环境变量 NIKKE_COOKIE_PATH 指定绝对路径。
+功能概述：
+- 输入 openid（Base64）或 intl_open_id。
+- 自动获取该用户“战力前十”的 name_code 并拉取详情。
+- 控制台仅输出最终摘要。
 
 工作流：
-1) 用户仅提供 URL 中的 openid（Base64）或 intl_open_id。
-2) 主程序调用副程序 A：nikke_top_codes.py，获取该用户“战力前十”的 name_code（不直接输出到终端，内部捕获）。
-3) 主程序调用副程序 B：nikke_api.py，用步骤 2 的 name_code 拉取“战力前十详情”，并输出最终 JSON/CSV 路径与状态。
+1) 调用 nikke_top_codes.py 获取前十 name_code（内部捕获不回显）。
+2) 调用 nikke_api.py 拉取前十详情，并输出 JSON/CSV 路径与状态。
 
-产物（由副程序生成）：
-  - storage/<timestamp>_TopCodes.json / .csv（副程序 A）
-  - storage/<timestamp>_GetUserCharacterDetails.json / .csv（副程序 B）
-  - storage/latest.json（副程序 B 的最近一次响应）
+产物：
+- storage/<timestamp>_TopCodes.json / .csv
+- storage/<timestamp>_GetUserCharacterDetails.json / .csv
+- storage/latest.json
 
 合规：
-  请确保目标用户已设为公开查询，并遵守限频（建议每用户 ≥ 5 分钟一次）。Cookie 必须有效。
+- 目标用户需公开查询，Cookie 必须有效。
+- 建议限频，每用户 ≥ 5 分钟一次。
 """
 
 import argparse
@@ -35,10 +31,11 @@ import subprocess
 import sys
 from typing import Optional, Tuple
 
-# 路径常量（基于插件目录）
+# 路径常量（统一到 AstrBot 专用数据目录）
 SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
-PLUGIN_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, ".."))
-DATA_DIR = os.path.join(PLUGIN_ROOT, "storage")
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", "..", "..", ".."))
+PLUGIN_DATA_DIR = os.path.join(ROOT_DIR, "data", "plugin_data", "qbot_nikkeinformation")
+DATA_DIR = PLUGIN_DATA_DIR
 TOP_CODES_PATH = os.path.join(SCRIPTS_DIR, "nikke_top_codes.py")
 API_PATH = os.path.join(SCRIPTS_DIR, "nikke_api.py")
 
@@ -241,8 +238,8 @@ def main() -> None:
     parser.add_argument("--page-url", default=None, help="完整查询页 URL（不提供则自动构造）")
     parser.add_argument(
         "--cookie-file",
-        default=os.path.join(PLUGIN_ROOT, ".nikke_auth", "cookie.txt"),
-        help="Cookie 文件路径（默认：插件目录下 .nikke_auth/cookie.txt）",
+        default=os.path.join(PLUGIN_DATA_DIR, "cookie.txt"),
+        help="Cookie 文件路径（默认：插件数据目录 cookie.txt）",
     )
     parser.add_argument("--quiet", action="store_true", help="静默模式：不打印副程序过程输出")
     args = parser.parse_args()

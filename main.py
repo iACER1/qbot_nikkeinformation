@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import shutil
 import re
 import json
 import base64
@@ -12,11 +13,14 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.api.provider import ProviderRequest
 from .ai_reply import build_bind_system_prompt, build_info_system_prompt
 
-# 插件内路径常量
+# 存储路径（AstrBot 数据目录 data/plugin_data/qbot_nikkeinformation）
 PLUGIN_DIR = os.path.abspath(os.path.dirname(__file__))
-STORAGE_DIR = os.path.join(PLUGIN_DIR, "storage")
+ROOT_DIR = os.path.abspath(os.path.join(PLUGIN_DIR, "..", "..", ".."))
+PLUGIN_DATA_DIR = os.path.join(ROOT_DIR, "data", "plugin_data", "qbot_nikkeinformation")
+STORAGE_DIR = PLUGIN_DATA_DIR
 BINDINGS_PATH = os.path.join(STORAGE_DIR, "bindings.json")
-COOKIE_FILE_DEFAULT = os.path.join(PLUGIN_DIR, ".nikke_auth", "cookie.txt")
+# Cookie 默认路径：插件数据目录的 cookie.txt
+COOKIE_FILE_DEFAULT = os.path.join(STORAGE_DIR, "cookie.txt")
 
 # 脚本常量（插件内脚本作为后端）
 RUNNER_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_runner.py")
@@ -29,6 +33,56 @@ NAMES_MAP_PATH = os.path.join(STORAGE_DIR, "nikke_names_zh.json")
 NAMES_FETCHER_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_names_fetcher.py")
 # 工会成员映射文件（openid/nickname → 成员）
 UNION_MEMBERS_MAP_PATH = os.path.join(STORAGE_DIR, "union_members_map.json")
+
+# 迁移旧存储目录文件到当前存储目录（幂等）
+def _migrate_storage_legacy() -> None:
+    try:
+        legacy_storage = os.path.join(PLUGIN_DIR, "storage")
+        if os.path.isdir(legacy_storage):
+            os.makedirs(STORAGE_DIR, exist_ok=True)
+            for fn in os.listdir(legacy_storage):
+                src = os.path.join(legacy_storage, fn)
+                dst = os.path.join(STORAGE_DIR, fn)
+                if not os.path.exists(dst):
+                    try:
+                        shutil.move(src, dst)
+                    except Exception:
+                        try:
+                            shutil.copy2(src, dst)
+                        except Exception:
+                            pass
+    except Exception:
+        # 迁移失败不影响后续逻辑
+        pass
+
+# 迁移旧 cookie.txt 至插件数据目录（优先候选：项目根/.nikke_auth、插件内/.nikke_auth、工作目录/.nikke_auth）
+def _migrate_cookie_legacy() -> None:
+    try:
+        new_cookie = os.path.join(STORAGE_DIR, "cookie.txt")
+        if not os.path.isfile(new_cookie):
+            candidates = [
+                os.path.join(ROOT_DIR, ".nikke_auth", "cookie.txt"),
+                os.path.join(PLUGIN_DIR, ".nikke_auth", "cookie.txt"),
+                os.path.join(os.getcwd(), ".nikke_auth", "cookie.txt"),
+            ]
+            for src in candidates:
+                if os.path.isfile(src):
+                    os.makedirs(STORAGE_DIR, exist_ok=True)
+                    try:
+                        shutil.move(src, new_cookie)
+                    except Exception:
+                        try:
+                            shutil.copy2(src, new_cookie)
+                        except Exception:
+                            pass
+                    break
+    except Exception:
+        # 忽略 cookie 迁移失败
+        pass
+
+# 在模块加载时执行一次迁移（幂等）
+_migrate_storage_legacy()
+_migrate_cookie_legacy()
 
 
 def _ensure_dir(p: str) -> None:
@@ -101,40 +155,47 @@ def _auto_page_url(openid_b64: str, type_: str = "combat") -> str:
 
 def _find_cookie_file() -> str:
     """
-    尝试在多候选路径中寻找 Cookie 文件：
-    1) 绝对路径：ROOT_DIR/.nikke_auth/cookie.txt（优先）
-    2) 相对路径：.nikke_auth/cookie.txt（兼容插件运行时的不同工作目录）
-    3) 环境变量：NIKKE_COOKIE_FILE（如设置则优先使用）
+    尝试在多候选路径中寻找 Cookie 文件（按优先级）：
+    1) 环境变量：NIKKE_COOKIE_FILE/NIKKE_COOKIE_PATH
+    2) 插件数据目录：data/plugin_data/qbot_nikkeinformation/cookie.txt
+    3) 兼容旧路径：项目根目录/.nikke_auth/cookie.txt、插件目录/.nikke_auth/cookie.txt、当前工作目录/.nikke_auth/cookie.txt
     """
+    env1 = os.environ.get("NIKKE_COOKIE_FILE", "").strip()
+    env2 = os.environ.get("NIKKE_COOKIE_PATH", "").strip()
     candidates = [
-        os.environ.get("NIKKE_COOKIE_FILE", "").strip(),
+        env1 if env1 else "",
+        env2 if env2 else "",
+        os.path.join(STORAGE_DIR, "cookie.txt"),
         COOKIE_FILE_DEFAULT,
-        os.path.join(os.path.abspath(os.path.join(PLUGIN_DIR, "..", "..", "..")), ".nikke_auth", "cookie.txt"),
+        os.path.join(ROOT_DIR, ".nikke_auth", "cookie.txt"),
+        os.path.join(PLUGIN_DIR, ".nikke_auth", "cookie.txt"),
         os.path.join(".nikke_auth", "cookie.txt"),
     ]
     for p in candidates:
         if p and os.path.isfile(p):
             return p
-    # 默认返回绝对路径，即便不存在，以便提示明确路径
-    return COOKIE_FILE_DEFAULT
+    # 默认返回插件数据目录 cookie.txt（即便不存在，以便提示明确路径）
+    return os.path.join(STORAGE_DIR, "cookie.txt")
 
 def _resolve_cookie_path() -> str:
     """
-    解析 Cookie 文件路径的优先级：
-    1) 环境变量 NIKKE_COOKIE_PATH 指定的绝对路径（只要非空即采用）
-    2) 插件目录下 .nikke_auth/cookie.txt（推荐）
-    3) 兼容旧路径：项目根目录下 .nikke_auth/cookie.txt
-    4) 当前工作目录下 .nikke_auth/cookie.txt
+    解析 Cookie 文件路径优先级：
+    1) 环境变量 NIKKE_COOKIE_PATH 指定路径（非空即采用）
+    2) 插件数据目录 cookie.txt（data/plugin_data/qbot_nikkeinformation/cookie.txt）
+    3) 兼容旧路径：项目根目录/.nikke_auth/cookie.txt → 插件目录/.nikke_auth/cookie.txt → 工作目录/.nikke_auth/cookie.txt
     """
     env_path = os.getenv("NIKKE_COOKIE_PATH", "").strip()
     if env_path:
         return env_path
-    if os.path.isfile(COOKIE_FILE_DEFAULT):
-        return COOKIE_FILE_DEFAULT
-    root_dir = os.path.abspath(os.path.join(PLUGIN_DIR, "..", "..", ".."))
-    legacy = os.path.join(root_dir, ".nikke_auth", "cookie.txt")
-    if os.path.isfile(legacy):
-        return legacy
+    new_default = os.path.join(STORAGE_DIR, "cookie.txt")
+    if os.path.isfile(new_default):
+        return new_default
+    legacy1 = os.path.join(ROOT_DIR, ".nikke_auth", "cookie.txt")
+    if os.path.isfile(legacy1):
+        return legacy1
+    legacy2 = os.path.join(PLUGIN_DIR, ".nikke_auth", "cookie.txt")
+    if os.path.isfile(legacy2):
+        return legacy2
     return os.path.join(os.getcwd(), ".nikke_auth", "cookie.txt")
 
 
@@ -370,7 +431,7 @@ def _summarize_from_latest(latest_path: str) -> str:
     return "\n".join(lines)
 
 
-# ---------------- 新增：工会战进度抓取与渲染辅助 ----------------
+# 工会战进度抓取与渲染辅助
 
 async def _run_union_raid(intl_open_id: str, openid_b64: str, cookie_file: str) -> Tuple[str, int, str]:
     """
@@ -591,7 +652,7 @@ def _build_union_raid_template() -> str:
 </html>
 """
 
-# ---------------- 新增：工会突袭成员出刀数据抓取与聚合 ----------------
+# 工会突袭成员出刀数据抓取与聚合
 
 async def _run_union_raid_members(intl_open_id: str, openid_b64: str, cookie_file: str) -> Tuple[str, int, str]:
     """
@@ -737,12 +798,14 @@ def _format_damage_b(v: int) -> str:
 def _parse_union_raid_members(latest_path: str) -> Tuple[List[Dict[str, Any]], str]:
     """
     解析 union_raid_members_latest.json
+    仅统计 day == 1 的出刀记录。
     返回 (rows, err)：
       rows: [{openid, nickname, attempts, total_damage}]
     聚合规则：
-      - 优先从包含 nickname/openid 的节点解析：
-          * 若存在 squad(list)，尝试累加其中每一刀的 total_damage
-          * 若不存在 squad 或没取到数值，则回退到当前节点的 total_damage/damage/score
+      - 优先解析 participate_data[*] 中 day == 1 的条目：
+          * 若存在 squad(list)，累加每一刀 total_damage
+          * 否则回退 total_damage/damage/score 字段
+      - 若不存在 participate_data，则回退通用深度遍历，但仅在 day 上下文为 1 时计入
       - 同成员（按 openid，否则按 nickname）进行合并：attempts 为刀数，total_damage 为总和
     """
     if not latest_path or not os.path.isfile(latest_path):
@@ -753,56 +816,225 @@ def _parse_union_raid_members(latest_path: str) -> Tuple[List[Dict[str, Any]], s
     except Exception as e:
         return [], f"成员出刀详情解析失败：{e}"
 
+    def to_int(x: Any, default: int = -1) -> int:
+        try:
+            s = str(x).strip()
+            if s == "":
+                return default
+            if "." in s:
+                return int(float(s))
+            return int(s)
+        except Exception:
+            return default
+
     agg: Dict[str, Dict[str, Any]] = {}
 
-    def collect_node(node: Dict[str, Any]) -> None:
-        nickname = node.get("nickname") or node.get("nick_name") or ""
-        openid = node.get("openid") or node.get("open_id") or node.get("intl_open_id") or ""
-        # 只在命名节点尝试提取伤害
-        if not (nickname or openid):
-            return
-        damages: List[int] = []
-        squad = node.get("squad")
-        if isinstance(squad, list):
-            for it in squad:
-                if isinstance(it, dict):
-                    d = _int_or_zero(it.get("total_damage") or it.get("damage") or it.get("total") or it.get("score"))
-                    if d > 0:
-                        damages.append(d)
-        if not damages:
-            d0 = _int_or_zero(node.get("total_damage") or node.get("damage") or node.get("total") or node.get("score"))
-            if d0 > 0:
-                damages.append(d0)
+    # 方式一：优先解析 participate_data[*] day==1
+    pd_candidates = [
+        obj.get("participate_data"),
+        obj.get("data", {}).get("participate_data") if isinstance(obj.get("data"), dict) else None,
+        obj.get("result", {}).get("participate_data") if isinstance(obj.get("result"), dict) else None,
+    ]
+    pd_list = None
+    for lst in pd_candidates:
+        if isinstance(lst, list) and lst:
+            pd_list = lst
+            break
 
+    def add_damage(openid: str, nickname: str, damages: List[int]) -> None:
         if not damages:
-            # 无伤害数字则忽略
             return
-
         key = str(openid or nickname)
-        cur = agg.setdefault(key, {"openid": str(openid or ""), "nickname": str(nickname or ""), "attempts": 0, "total_damage": 0})
+        cur = agg.setdefault(key, {
+            "openid": str(openid or ""),
+            "nickname": str(nickname or ""),
+            "attempts": 0,
+            "total_damage": 0
+        })
         cur["attempts"] += len(damages)
         cur["total_damage"] += sum(damages)
 
-    def walk(o: Any) -> None:
-        if isinstance(o, dict):
-            # 当前节点尝试收集
-            collect_node(o)
-            for v in o.values():
-                walk(v)
-        elif isinstance(o, list):
-            for it in o:
-                walk(it)
+    if pd_list is not None:
+        for ent in pd_list:
+            if not isinstance(ent, dict):
+                continue
+            day_val = to_int(ent.get("day"), default=-1)
+            if day_val != 1:
+                continue  # 只要 day1
+            nickname = ent.get("nickname") or ent.get("nick_name") or ""
+            openid = ent.get("openid") or ent.get("open_id") or ent.get("intl_open_id") or ""
 
-    # 兼容多层 data/result 包裹
-    walk(obj.get("data") or obj.get("result") or obj)
+            damages: List[int] = []
+            squad = ent.get("squad")
+            if isinstance(squad, list):
+                for it in squad:
+                    if isinstance(it, dict):
+                        d = _int_or_zero(it.get("total_damage") or it.get("damage") or it.get("total") or it.get("score"))
+                        if d > 0:
+                            damages.append(d)
+            if not damages:
+                d0 = _int_or_zero(ent.get("total_damage") or ent.get("damage") or ent.get("total") or ent.get("score"))
+                if d0 > 0:
+                    damages.append(d0)
+
+            add_damage(openid, nickname, damages)
+
+    # 方式二：回退深度遍历，传递 day 上下文，仅统计 day==1
+    if not agg:
+        def collect_node(node: Dict[str, Any], day_ctx: Optional[int]) -> None:
+            if day_ctx != 1:
+                return
+            nickname = node.get("nickname") or node.get("nick_name") or ""
+            openid = node.get("openid") or node.get("open_id") or node.get("intl_open_id") or ""
+            if not (nickname or openid):
+                return
+            damages: List[int] = []
+            squad = node.get("squad")
+            if isinstance(squad, list):
+                for it in squad:
+                    if isinstance(it, dict):
+                        d = _int_or_zero(it.get("total_damage") or it.get("damage") or it.get("total") or it.get("score"))
+                        if d > 0:
+                            damages.append(d)
+            if not damages:
+                d0 = _int_or_zero(node.get("total_damage") or node.get("damage") or node.get("total") or node.get("score"))
+                if d0 > 0:
+                    damages.append(d0)
+            add_damage(openid, nickname, damages)
+
+        def walk(o: Any, day_ctx: Optional[int] = None) -> None:
+            if isinstance(o, dict):
+                # 更新 day 上下文
+                day_here = o.get("day")
+                ctx = to_int(day_here, default=day_ctx if day_ctx is not None else -1)
+                collect_node(o, ctx)
+                for v in o.values():
+                    walk(v, ctx)
+            elif isinstance(o, list):
+                for it in o:
+                    walk(it, day_ctx)
+
+        walk(obj.get("data") or obj.get("result") or obj)
+
     rows = list(agg.values())
-
     if not rows:
-        return [], "未解析到任何成员出刀项。"
+        return [], "未解析到任何成员出刀项（或 day1 数据为空）。"
 
-    # 排序：按总伤害降序
+    # 成功解析到 rows：按总伤害降序返回
     rows.sort(key=lambda x: int(x.get("total_damage") or 0), reverse=True)
     return rows, ""
+def _build_union_members_remaining_template() -> str:
+    """
+    构造用于渲染“未出刀/未出满三刀”列表的 HTML 表格模板（Jinja2）。
+    表头（简体）：No. | 成员 | 已出刀 | 剩余次数
+    """
+    return """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>NIKKE 联盟突袭未出刀/未出满</title>
+<style>
+  html, body { margin:0; padding:0; background:#fff; width:100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC","Microsoft YaHei", sans-serif; display:block; }
+  .card { width:100%; max-width:100%; box-sizing:border-box; padding:16px 18px; border-radius:14px; background:#ffffff; box-shadow:none; margin:0; }
+  .title { font-size:20px; font-weight:700; color:#111827; margin-bottom: 8px; }
+  .subtitle { font-size:13px; color:#6B7280; margin-bottom: 12px; }
+  table { width:100%; border-collapse: collapse; font-size:14px; }
+  th, td { border-bottom: 1px solid #eee; padding:8px 10px; text-align:left; }
+  th { color:#374151; font-weight:600; background:#f9fafb; }
+  .no { width:56px; }
+  .member { min-width:160px; }
+  .attempts { width:100px; }
+  .remain { width:100px; font-weight:600; color:#B91C1C; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">联盟突袭未出刀/未出满</div>
+    <table>
+      <thead>
+        <tr>
+          <th class="no">No.</th>
+          <th class="member">成员</th>
+          <th class="attempts">已出刀</th>
+          <th class="remain">剩余次数</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td class="no">{{ loop.index }}</td>
+          <td class="member">{{ r.member }}</td>
+          <td class="attempts">{{ r.attempts }}</td>
+          <td class="remain">{{ r.remaining }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+"""
+
+
+def _compute_unfilled(map_items: List[Dict[str, str]], rows: List[Dict[str, Any]], max_required: int = 3) -> List[Dict[str, Any]]:
+    """
+    基于“现有映射”与当天(day1)的出刀聚合结果 rows，计算
+    - 未出刀（attempts == 0）
+    - 未出满三刀（0 < attempts < max_required）
+    返回展示列表：[{member, attempts, remaining}]
+    规则：
+      - 仅统计映射中非空项（至少 openid/nickname/member 有一个非空）
+      - 匹配顺序：openid 优先；若无 openid 则按 nickname 匹配
+      - 成员显示名：优先映射 member，其次 nickname，最后 openid
+    """
+    # 构建观测索引
+    by_openid: Dict[str, Dict[str, Any]] = {}
+    by_nick: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        oid = str(r.get("openid") or "").strip()
+        nick = str(r.get("nickname") or "").strip()
+        if oid:
+            by_openid[oid] = r
+        if nick:
+            by_nick[nick] = r
+
+    out: List[Dict[str, Any]] = []
+    for it in map_items:
+        if not isinstance(it, dict):
+            continue
+        openid = str(it.get("openid") or "").strip()
+        nickname = str(it.get("nickname") or "").strip()
+        member = str(it.get("member") or "").strip()
+        # 忽略完全空位
+        if not (openid or nickname or member):
+            continue
+
+        attempts = 0
+        ref = None
+        if openid and openid in by_openid:
+            ref = by_openid[openid]
+        elif nickname and nickname in by_nick:
+            ref = by_nick[nickname]
+        if ref:
+            try:
+                attempts = int(ref.get("attempts") or 0)
+            except Exception:
+                attempts = 0
+
+        remaining = max(0, max_required - attempts)
+        # 仅纳入 attempts < max_required 的成员
+        if attempts < max_required:
+            out.append({
+                "member": member or nickname or openid or "未知成员",
+                "attempts": attempts,
+                "remaining": remaining
+            })
+
+    # 排序：已出刀次数升序；同次数按成员名拼音/字典序
+    out.sort(key=lambda x: (int(x["attempts"]), str(x["member"])))
+    return out
 
 
 def _build_union_members_template() -> str:
@@ -818,9 +1050,9 @@ def _build_union_members_template() -> str:
 <meta charset="UTF-8">
 <title>NIKKE 联盟突袭出刀情况</title>
 <style>
-  html, body { margin:0; padding:0; background:#fff; width:100%; height:100vh; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC","Microsoft YaHei", sans-serif; display:flex; align-items:flex-start; justify-content:flex-start; }
-  .card { width:100vw; box-sizing:border-box; padding:16px 18px; border-radius:14px; background:#ffffff; box-shadow:none; margin:0; }
+  html, body { margin:0; padding:0; background:#fff; width:100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC","Microsoft YaHei", sans-serif; display:block; }
+  .card { width:100%; max-width:100%; box-sizing:border-box; padding:16px 18px; border-radius:14px; background:#ffffff; box-shadow:none; margin:0; }
   .title { font-size:20px; font-weight:700; color:#111827; margin-bottom: 8px; }
   table { width:100%; border-collapse: collapse; font-size:14px; }
   th, td { border-bottom: 1px solid #eee; padding:8px 10px; text-align:left; }
@@ -829,100 +1061,7 @@ def _build_union_members_template() -> str:
   .member { min-width:160px; }
   .attempts { width:100px; }
   .total { width:140px; font-weight:600; color:#111827; }
-  .muted { color:#6B7280; font-size:12px; }
 </style>
-    @nikke.command("unionraid_members", alias={"出刀", "刀表", "出刀情况", "members"})
-    async def unionraid_members(self, event: AstrMessageEvent):
-        """
-        联盟突袭成员出刀情况表（合并总伤害、按总伤害降序，首行简体中文）。
-        处理流程：
-        1) 直连接口获取包含 nickname、openid、单刀 total_damage 的原始数据；
-        2) 聚合同一成员多刀的总伤害与参与次数；
-        3) 读取本地映射 storage/union_members_map.json，将“成员”列用映射的 member 字段展示；
-           - 首次运行若映射不存在：以现有观测成员初始化（member 默认=nickname），补齐至 32 个占位；
-           - 后续仅读取该文件，不会覆盖；你可自行编辑完善该文件。
-        """
-        # 读取绑定
-        bindings = _load_bindings()
-        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
-        bind = bindings.get(key)
-        if not bind:
-            yield event.plain_result("尚未绑定。请先使用 /nikke bind <openid> 完成绑定。")
-            return
-
-        openid_b64 = bind.get("openid_base64")
-        intl_open_id = bind.get("intl_open_id")
-
-        # 若未保存 openid_base64，则根据 intl_open_id 构造一个 Base64("29080-<intl_open_id>")
-        if not openid_b64 and intl_open_id:
-            try:
-                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
-            except Exception:
-                openid_b64 = ""
-
-        # 校验 Cookie
-        cookie_file = _resolve_cookie_path()
-        if not os.path.isfile(cookie_file):
-            yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
-            return
-
-        # 执行后端：抓取成员出刀数据
-        try:
-            latest_path, status, runner_out = await _run_union_raid_members(
-                intl_open_id=str(intl_open_id),
-                openid_b64=str(openid_b64 or ""),
-                cookie_file=cookie_file,
-            )
-        except Exception as e:
-            logger.error(f"工会成员出刀运行失败：{e}")
-            yield event.plain_result(f"出刀情况查询失败：{e}")
-            return
-
-        # 解析与聚合
-        rows, err = _parse_union_raid_members(latest_path)
-        if err:
-            yield event.plain_result(err)
-            return
-        if not rows:
-            yield event.plain_result("未解析到任何成员出刀项。")
-            return
-
-        # 首次运行：若映射文件不存在则按当前观测初始化；之后仅读取
-        observed = [{"openid": r.get("openid", ""), "nickname": r.get("nickname", "")} for r in rows]
-        map_items = _init_union_members_map_if_missing(observed, max_slots=32)
-
-        # 组装展示行：成员名来自映射中的 member 字段
-        disp = []
-        for r in rows:
-            member = _lookup_member_name(map_items, r.get("openid", ""), r.get("nickname", ""))
-            attempts = int(r.get("attempts") or 0)
-            total_damage = int(r.get("total_damage") or 0)
-            disp.append({
-                "member": member,
-                "attempts": attempts,
-                "total_damage": total_damage,
-                "total_fmt": _format_damage_b(total_damage),
-            })
-        # 按总伤害降序
-        disp.sort(key=lambda x: int(x["total_damage"]), reverse=True)
-
-        # 渲染表格（首行简体）
-        try:
-            tmpl = _build_union_members_template()
-            img_url = await self.html_render(
-                tmpl,
-                {"rows": disp},
-                return_url=True,
-                options={"type": "jpeg", "full_page": False}
-            )
-            yield event.image_result(img_url)
-        except Exception as e:
-            logger.error(f"成员出刀表渲染失败：{e}")
-            # 纯文本回退
-            lines = ["No. | 成员 | 参与次数 | 总伤害"]
-            for i, d in enumerate(disp, start=1):
-                lines.append(f"{i} | {d['member']} | {d['attempts']} | {d['total_fmt']}")
-            yield event.plain_result("联盟突袭出刀情况：\n" + "\n".join(lines))
 </head>
 <body>
   <div class="card">
@@ -947,7 +1086,6 @@ def _build_union_members_template() -> str:
         {% endfor %}
       </tbody>
     </table>
-    <div class="muted">注：成员列来源于本地映射（openid:成员昵称:成员）。如需修正请编辑 storage/union_members_map.json。</div>
   </div>
 </body>
 </html>
@@ -1039,7 +1177,7 @@ class NikkePlugin(Star):
     async def info(self, event: AstrMessageEvent):
         """
         查询已绑定账户的战力前十详情。
-        要求：.nikke_auth/cookie.txt 存在且为有效登录态。
+        要求：插件数据目录 cookie.txt 存在且为有效登录态。
         """
         # 读取绑定
         bindings = _load_bindings()
@@ -1175,7 +1313,7 @@ class NikkePlugin(Star):
             yield event.plain_result("未解析到任何 Boss 进度项。")
             return
 
-        # 渲染进度图（回退到首次实现版本）
+        # 渲染进度图
         try:
             tmpl = _build_union_raid_template()
             img_url = await self.html_render(
@@ -1192,6 +1330,173 @@ class NikkePlugin(Star):
                 lines.append(f"{it['name']}: {it['percent']}%  {it['current_fmt']} / {it['max_fmt']}")
             yield event.plain_result("工会战 Boss 进度：\n" + "\n".join(lines))
 
+    @nikke.command("unionraid_members", alias={"出刀", "刀表", "出刀情况", "members"})
+    async def unionraid_members(self, event: AstrMessageEvent):
+        """
+        联盟突袭成员出刀情况表（合并总伤害、按总伤害降序，首行简体中文）。
+        流程：
+        1) 直连接口获取包含 nickname、openid、单刀 total_damage 的原始数据；
+        2) 聚合同一成员的总伤害与参与次数；
+        3) 读取本地映射 storage/union_members_map.json，将“成员”列用映射的 member 字段展示。
+           - 首次运行若映射不存在：以现有观测成员初始化（member 默认=nickname），补齐至 32 个占位；
+           - 后续仅读取该文件，不会覆盖；你可自行编辑完善该文件。
+        """
+        # 读取绑定
+        bindings = _load_bindings()
+        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
+        bind = bindings.get(key)
+        if not bind:
+            yield event.plain_result("尚未绑定。请先使用 /nikke bind <openid> 完成绑定。")
+            return
+
+        openid_b64 = bind.get("openid_base64")
+        intl_open_id = bind.get("intl_open_id")
+
+        # 若未保存 openid_base64，则根据 intl_open_id 构造一个 Base64("29080-<intl_open_id>")
+        if not openid_b64 and intl_open_id:
+            try:
+                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
+            except Exception:
+                openid_b64 = ""
+
+        # 校验 Cookie
+        cookie_file = _resolve_cookie_path()
+        if not os.path.isfile(cookie_file):
+            yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
+            return
+
+        # 执行后端：抓取成员出刀数据
+        try:
+            latest_path, status, runner_out = await _run_union_raid_members(
+                intl_open_id=str(intl_open_id),
+                openid_b64=str(openid_b64 or ""),
+                cookie_file=cookie_file,
+            )
+        except Exception as e:
+            logger.error(f"工会成员出刀运行失败：{e}")
+            yield event.plain_result(f"出刀情况查询失败：{e}")
+            return
+
+        # 解析与聚合
+        rows, err = _parse_union_raid_members(latest_path)
+        if err:
+            yield event.plain_result(err)
+            return
+        if not rows:
+            yield event.plain_result("未解析到任何成员出刀项。")
+            return
+
+        # 首次运行：若映射文件不存在则按当前观测初始化；之后仅读取
+        observed = [{"openid": r.get("openid", ""), "nickname": r.get("nickname", "")} for r in rows]
+        map_items = _init_union_members_map_if_missing(observed, max_slots=32)
+
+        # 组装展示行：成员名来自映射中的 member 字段
+        disp = []
+        for r in rows:
+            member = _lookup_member_name(map_items, r.get("openid", ""), r.get("nickname", ""))
+            attempts = int(r.get("attempts") or 0)
+            total_damage = int(r.get("total_damage") or 0)
+            disp.append({
+                "member": member,
+                "attempts": attempts,
+                "total_damage": total_damage,
+                "total_fmt": _format_damage_b(total_damage),
+            })
+        # 按总伤害降序
+        disp.sort(key=lambda x: int(x["total_damage"]), reverse=True)
+
+        # 渲染表格（首行简体）
+        try:
+            tmpl = _build_union_members_template()
+            img_url = await self.html_render(
+                tmpl,
+                {"rows": disp},
+                return_url=True,
+                options={"type": "jpeg", "full_page": True}
+            )
+            yield event.image_result(img_url)
+        except Exception as e:
+            logger.error(f"成员出刀表渲染失败：{e}")
+            # 纯文本回退
+            lines = ["No. | 成员 | 参与次数 | 总伤害"]
+            for i, d in enumerate(disp, start=1):
+                lines.append(f"{i} | {d['member']} | {d['attempts']} | {d['total_fmt']}")
+            yield event.plain_result("联盟突袭出刀情况：\n" + "\n".join(lines))
+
+    @nikke.command("unionraid_missing", alias={"未出刀", "未满", "不满三刀", "缺刀", "missing", "remain"})
+    async def unionraid_missing(self, event: AstrMessageEvent):
+        """
+        联盟突袭未出刀/未出满三刀清单（依据现有映射；仅统计 day1）。
+        """
+        # 读取绑定
+        bindings = _load_bindings()
+        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
+        bind = bindings.get(key)
+        if not bind:
+            yield event.plain_result("尚未绑定。请先使用 /nikke bind <openid> 完成绑定。")
+            return
+
+        openid_b64 = bind.get("openid_base64")
+        intl_open_id = bind.get("intl_open_id")
+
+        # 若未保存 openid_base64，则根据 intl_open_id 构造一个 Base64("29080-<intl_open_id>")
+        if not openid_b64 and intl_open_id:
+            try:
+                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
+            except Exception:
+                openid_b64 = ""
+
+        # 校验 Cookie
+        cookie_file = _resolve_cookie_path()
+        if not os.path.isfile(cookie_file):
+            yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
+            return
+
+        # 拉取 day1 出刀聚合
+        try:
+            latest_path, status, runner_out = await _run_union_raid_members(
+                intl_open_id=str(intl_open_id),
+                openid_b64=str(openid_b64 or ""),
+                cookie_file=cookie_file,
+            )
+        except Exception as e:
+            logger.error(f"工会成员出刀运行失败：{e}")
+            yield event.plain_result(f"未出刀清单查询失败：{e}")
+            return
+
+        rows, err = _parse_union_raid_members(latest_path)
+        if err:
+            yield event.plain_result(err)
+            return
+
+        # 读取映射；若不存在则用观测构建一次
+        map_items = _read_union_members_map()
+        if not map_items:
+            observed = [{"openid": r.get("openid", ""), "nickname": r.get("nickname", "")} for r in rows]
+            map_items = _init_union_members_map_if_missing(observed, max_slots=32)
+
+        unfilled = _compute_unfilled(map_items, rows, max_required=3)
+        if not unfilled:
+            yield event.plain_result("全员已出满三刀。")
+            return
+
+        # 渲染列表
+        try:
+            tmpl = _build_union_members_remaining_template()
+            img_url = await self.html_render(
+                tmpl,
+                {"rows": unfilled},
+                return_url=True,
+                options={"type": "jpeg", "full_page": True}
+            )
+            yield event.image_result(img_url)
+        except Exception as e:
+            logger.error(f"未出刀清单渲染失败：{e}")
+            lines = ["No. | 成员 | 已出刀 | 剩余次数"]
+            for i, d in enumerate(unfilled, start=1):
+                lines.append(f"{i} | {d['member']} | {d['attempts']} | {d['remaining']}")
+            yield event.plain_result("未出刀/未出满清单：\n" + "\n".join(lines))
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @nikke.command("cookie", alias={"设置cookie"})
     async def set_cookie_hint(self, event: AstrMessageEvent):
@@ -1202,7 +1507,7 @@ class NikkePlugin(Star):
             f"Cookie 文件首选：{resolved}\n"
             f"状态：{'已存在' if exists else '未找到'}\n"
             f"可通过环境变量 NIKKE_COOKIE_PATH 指定绝对路径；"
-            f"默认使用插件目录 {COOKIE_FILE_DEFAULT}（兼容旧路径：项目根目录/.nikke_auth/cookie.txt）。"
+            f"默认使用插件数据目录 {os.path.join(STORAGE_DIR, 'cookie.txt')}（首次运行会从旧路径自动迁移）。"
         )
         yield event.plain_result(msg)
 
@@ -1288,3 +1593,4 @@ class NikkePlugin(Star):
 
     async def terminate(self):
         """插件卸载时的清理（当前无需处理）。"""
+

@@ -27,9 +27,10 @@ API_URL_DEFAULT = "https://api.blablalink.com/api/game/proxy/Game/GetUnionRaidDa
 
 # 插件内路径
 SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
-PLUGIN_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, ".."))
-STORAGE_DIR = os.path.join(PLUGIN_ROOT, "storage")
-COOKIE_DEFAULT = os.path.join(PLUGIN_ROOT, ".nikke_auth", "cookie.txt")
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", "..", "..", ".."))
+PLUGIN_DATA_DIR = os.path.join(ROOT_DIR, "data", "plugin_data", "qbot_nikkeinformation")
+STORAGE_DIR = PLUGIN_DATA_DIR
+COOKIE_DEFAULT = os.path.join(PLUGIN_DATA_DIR, "cookie.txt")
 
 
 def ensure_dir(path: str) -> None:
@@ -159,7 +160,7 @@ def main() -> None:
     parser.add_argument("--area-id", type=int, default=81, help="nikke_area_id，默认为 81")
     parser.add_argument("--language", default="zh-TW", help="x-language 与 x-common-params 中的 language（默认 zh-TW）")
     parser.add_argument("--page-url", required=True, help="页面 URL（用于 x-common-params.data_statistics_page_id）")
-    parser.add_argument("--cookie-file", default=COOKIE_DEFAULT, help="Cookie 文件路径（默认：插件目录下 .nikke_auth/cookie.txt）")
+    parser.add_argument("--cookie-file", default=COOKIE_DEFAULT, help="Cookie 文件路径（默认：插件数据目录 cookie.txt）")
     parser.add_argument("--extra-header", action="append", default=[], help='附加头部，格式 "Key=Value"，可重复传入')
     args = parser.parse_args()
 

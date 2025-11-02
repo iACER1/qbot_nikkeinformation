@@ -6,7 +6,7 @@ Nikke 中文名称映射抓取器
 - 用法（示例）：
     python data/plugins/qbot_nikkeinformation/scripts/nikke_names_fetcher.py ^
         --url https://sg-tools-cdn.blablalink.com/vm-36/bj-70/6223a9fbfd3be53b48587c934a91f686.json ^
-        --out data/plugins/qbot_nikkeinformation/storage/nikke_names_zh.json
+        --out data/plugin_data/qbot_nikkeinformation/nikke_names_zh.json
 
 说明
 - 这些 CDN JSON 通常是“公共库/素材库”数据快照，条目中存在：
@@ -27,8 +27,9 @@ import requests
 
 
 SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
-PLUGIN_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, ".."))
-STORAGE_DIR = os.path.join(PLUGIN_ROOT, "storage")
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", "..", "..", ".."))
+PLUGIN_DATA_DIR = os.path.join(ROOT_DIR, "data", "plugin_data", "qbot_nikkeinformation")
+STORAGE_DIR = PLUGIN_DATA_DIR
 DEFAULT_OUT = os.path.join(STORAGE_DIR, "nikke_names_zh.json")
 
 

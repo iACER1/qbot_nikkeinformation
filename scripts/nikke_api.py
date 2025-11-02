@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Nikke API 练度采集（插件内直连接口方案）
+Nikke API 练度采集（插件内直连接口）
 
-迁移说明：
-- 本脚本已移动至插件目录：/AstrBot/data/plugins/qbot_nikkeinformation/scripts
-- 产物统一输出至：/AstrBot/data/plugins/qbot_nikkeinformation/storage
-- 默认 Cookie 文件：/AstrBot/data/plugins/qbot_nikkeinformation/.nikke_auth/cookie.txt
-  也可通过 --cookie-file 或环境变量 NIKKE_COOKIE_PATH 指定。
+功能概述：
+- 直连接口获取用户角色详情数据。
+- 支持通过 Cookie 或参数提供 intl_open_id、name_codes。
+- 输出最近一次响应 latest.json 与 HTTP 状态码。
 
-合规提示：
-- 请确保你对目标账号拥有授权，且抓取频率合理（建议每用户每 ≥5 分钟），避免影响站点服务。
+合规：
+- 请确保你对目标账号拥有授权，并设置合理抓取频率（建议每用户 ≥ 5 分钟）。
 """
 
 import argparse
@@ -28,11 +27,12 @@ import requests
 
 API_URL_DEFAULT = "https://api.blablalink.com/api/game/proxy/Game/GetUserCharacterDetails"
 
-# 基于插件内路径的存储与默认 Cookie
+# 路径常量统一到 AstrBot 专用数据目录与插件数据 Cookie
 SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
-PLUGIN_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, ".."))
-STORAGE_DIR = os.path.join(PLUGIN_ROOT, "storage")
-COOKIE_DEFAULT = os.path.join(PLUGIN_ROOT, ".nikke_auth", "cookie.txt")
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", "..", "..", ".."))
+PLUGIN_DATA_DIR = os.path.join(ROOT_DIR, "data", "plugin_data", "qbot_nikkeinformation")
+STORAGE_DIR = PLUGIN_DATA_DIR
+COOKIE_DEFAULT = os.path.join(PLUGIN_DATA_DIR, "cookie.txt")
 
 
 def ensure_dir(path: str) -> None:
@@ -243,7 +243,7 @@ def main() -> None:
     parser.add_argument("--area-id", type=int, default=81, help="nikke_area_id，默认为 81")
     parser.add_argument("--language", default="en", help="x-language 与 x-common-params 中的 language（默认 en）")
     parser.add_argument("--page-url", required=True, help="页面 URL（用于 x-common-params.data_statistics_page_id）")
-    parser.add_argument("--cookie-file", default=COOKIE_DEFAULT, help="Cookie 文件路径（默认：插件目录下 .nikke_auth/cookie.txt）")
+    parser.add_argument("--cookie-file", default=COOKIE_DEFAULT, help="Cookie 文件路径（默认：插件数据目录 cookie.txt）")
     parser.add_argument("--extra-header", action="append", default=[], help='附加头部，格式 "Key=Value"，可重复传入')
     parser.add_argument("--out-prefix", default="GetUserCharacterDetails", help="输出文件名前缀")
     args = parser.parse_args()

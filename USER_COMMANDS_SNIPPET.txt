@@ -1,0 +1,8 @@
+查装备相关：
+/nikke bind 此处输入ID —— 绑定ID，ID为blabla上的数字ID
+/nikke info —— 战力排名前十的装备情况查询。
+其他功能更新中
+联盟突袭相关：
+/nikke unionraid 查询血量信息
+/nikke unionraid_members 查询出刀情况
+/nikke unionraid_missing 查询未出刀情况

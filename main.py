@@ -1313,12 +1313,14 @@ class NikkePlugin(Star):
             yield event.plain_result(text)
 
     @nikke.command("namecode", alias={"code", "角色详情", "nc"})
-    async def namecode(self, event: AstrMessageEvent, *codes: str, **kwargs: Any):
+    async def namecode(self, event: AstrMessageEvent, codes: str = "", *more: str, **kwargs: Any):
         """
         通过指定 name_code 查询角色详情（可一次查询多个，使用逗号或空格分隔）。
         """
         raw_segments: List[str] = []
-        raw_segments.extend([c for c in codes if c is not None])
+        raw_segments.append(codes)
+
+        raw_segments.extend([c for c in more if c is not None])
 
         kw_codes = kwargs.get("codes")
         if kw_codes:

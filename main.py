@@ -486,6 +486,186 @@ def _summarize_from_latest(latest_path: str) -> str:
     return "\n".join(lines)
 
 
+def _summarize_full_equips(latest_path: str, prefer_lang: str = "zh-tw") -> str:
+    """
+    针对“按 namecode 指定角色查询”的完整装备展示：
+    - 不做词条汇总，逐装备逐词条原样列出；
+    - 每个角色按 头部/胸部/手臂/腿部 顺序展示，每件装备的三个词条逐行显示；
+    - 数值展示规则与聚合版本一致：Percent 两位小数加百分号；部分词条强制按百分比显示。
+    """
+    if not latest_path or not os.path.isfile(latest_path):
+        return "未找到最新详情文件。"
+    try:
+        with open(latest_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception as e:
+        return f"详情文件解析失败：{e}"
+
+    # 载入 code→中文名映射
+    names_map = _load_names_map()
+
+    # 角色详情
+    details_candidates = [
+        obj.get("character_details"),
+        obj.get("data", {}).get("character_details") if isinstance(obj.get("data"), dict) else None,
+        obj.get("result", {}).get("character_details") if isinstance(obj.get("result"), dict) else None,
+    ]
+    rows = None
+    for lst in details_candidates:
+        if isinstance(lst, list) and lst:
+            rows = lst
+            break
+    if not rows:
+        return "响应中未找到 character_details 列表。"
+
+    # 状态/效果映射：option_id -> function_details(list)
+    eff_candidates = [
+        obj.get("state_effects"),
+        obj.get("data", {}).get("state_effects") if isinstance(obj.get("data"), dict) else None,
+        obj.get("result", {}).get("state_effects") if isinstance(obj.get("result"), dict) else None,
+    ]
+    effects = None
+    for lst in eff_candidates:
+        if isinstance(lst, list):
+            effects = lst
+            break
+    effects = effects or []
+    effect_map: Dict[str, list] = {}
+    for eff in effects:
+        try:
+            eff_id = str(eff.get("id"))
+            fd = eff.get("function_details") or []
+            if eff_id and isinstance(fd, list):
+                effect_map[eff_id] = fd
+        except Exception:
+            continue
+
+    # 标签与格式化
+    TYPE_LABELS = {
+        "StatAmmoLoad": "最大装弹数",
+        "StatAtk": "攻击",
+        "StatDef": "防御",
+        "StatCritical": "暴击率",
+        "StatCriticalDamage": "暴击伤害",
+        "StatChargeTime": "蓄力速度",
+        "StatChargeDamage": "蓄力伤害",
+        "StatAccuracyCircle": "命中率",
+        "IncElementDmg": "优越代码伤害",
+    }
+    FORCE_PERCENT_TYPES = {"StatCriticalDamage", "StatCritical", "StatChargeDamage"}
+
+    def pick_power(d: Dict[str, Any]) -> Optional[int]:
+        for k in ["power", "combat", "combat_power", "score"]:
+            v = d.get(k)
+            if v is None:
+                continue
+            try:
+                return int(float(str(v)))
+            except Exception:
+                continue
+        return None
+
+    def extract_grad(fd: Dict[str, Any]) -> int:
+        lvl = fd.get("level")
+        if isinstance(lvl, int):
+            return lvl
+        _id = str(fd.get("id") or "")
+        try:
+            if len(_id) >= 7:
+                return int(_id[5:7])
+        except Exception:
+            pass
+        return 0
+
+    def norm_value(fd: Dict[str, Any], force_percent: bool = False) -> float:
+        v = fd.get("function_value")
+        t = fd.get("function_value_type")
+        try:
+            val = float(str(v))
+        except Exception:
+            return 0.0
+        if force_percent or str(t).lower() == "percent":
+            return val / 100.0
+        return val
+
+    def format_value(val: float, value_type: str) -> str:
+        val_abs = abs(val)
+        if str(value_type).lower() == "percent":
+            return f"{val_abs:.2f}%"
+        if abs(val_abs - round(val_abs)) < 1e-6:
+            return f"{int(round(val_abs))}"
+        return f"{val_abs:.2f}"
+
+    part_names = [
+        ("head", "头部"),
+        ("torso", "胸部"),
+        ("arm", "手臂"),
+        ("leg", "腿部"),
+    ]
+
+    lines: List[str] = []
+    for idx, ch in enumerate(rows, start=1):
+        name = ch.get("name") or ch.get("nikke_name") or ch.get("display_name")
+        code = ch.get("name_code") or ch.get("code") or ""
+        # 中文名回退：优先映射
+        if (not name) and code is not None:
+            try:
+                code_key = str(int(float(str(code))))
+            except Exception:
+                code_key = str(code)
+            name = names_map.get(code_key, name)
+        pw = pick_power(ch)
+        show_name = name if name else (f"未知角色({code})" if code else "未知角色")
+        lines.append(f"{show_name}  战力：{pw if pw is not None else '未知'}")
+
+        # 四件装备逐条展示
+        for part_key, part_disp in part_names:
+            # 收集该部位的 option_id 列表（最多 3 条）
+            equip_ids: List[str] = []
+            for i in (1, 2, 3):
+                k = f"{part_key}_equip_option{i}_id"
+                v = ch.get(k)
+                try:
+                    if v and int(v) != 0:
+                        equip_ids.append(str(v))
+                except Exception:
+                    continue
+
+            if not equip_ids:
+                lines.append(f"  {part_disp}：无装备词条")
+                continue
+
+            lines.append(f"  {part_disp}：")
+            # 对每个 option_id 列出其 function_details
+            for eid in equip_ids:
+                fd_list = effect_map.get(eid) or []
+                if not fd_list:
+                    lines.append(f"    · 词条ID {eid}：无详细信息")
+                    continue
+                # 逐 function_details 展示
+                for fd in fd_list:
+                    ftype = fd.get("function_type") or "Unknown"
+                    vtype = fd.get("function_value_type") or ""
+                    force_pct = ftype in FORCE_PERCENT_TYPES
+                    val = norm_value(fd, force_percent=force_pct)
+                    if force_pct:
+                        vtype = "Percent"
+                    grad = extract_grad(fd)
+                    label = TYPE_LABELS.get(ftype, ftype)
+                    val_text = format_value(float(val), str(vtype))
+                    # 展示样式：标签 值 (LvX) [id]
+                    show_id = fd.get("id")
+                    if show_id is None:
+                        lines.append(f"    · {label}：{val_text} (Lv{grad})")
+                    else:
+                        lines.append(f"    · {label}：{val_text} (Lv{grad}) [id={show_id}]")
+
+        # 角色间空行分隔
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
 # 工会战进度抓取与渲染辅助
 
 async def _run_union_raid(intl_open_id: str, openid_b64: str, cookie_file: str) -> Tuple[str, int, str]:
@@ -1372,7 +1552,7 @@ class NikkePlugin(Star):
             return
 
         # 汇总展示
-        summary = _summarize_from_latest(latest_path)
+        summary = _summarize_full_equips(latest_path, prefer_lang="zh-tw")
 
         # 尝试用本地映射将 code → 名称，便于确认
         names_map = _load_names_map()

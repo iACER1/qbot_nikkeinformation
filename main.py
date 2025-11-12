@@ -24,6 +24,7 @@ COOKIE_FILE_DEFAULT = os.path.join(STORAGE_DIR, "cookie.txt")
 
 # 脚本常量（插件内脚本作为后端）
 RUNNER_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_runner.py")
+API_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_api.py")
 # 工会战进度采集脚本
 RUNNER_UNION_RAID_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_union_raid.py")
 # 工会突袭成员出刀采集脚本
@@ -237,6 +238,58 @@ async def _run_runner(intl_open_id: str, openid_b64: str, cookie_file: str, type
     http_status = int(m_status.group(1)) if m_status else 0
     return json_path, csv_path, latest_path, http_status, out
 
+async def _run_api_by_namecodes(intl_open_id: str, openid_b64: str, cookie_file: str, name_codes: List[int], language: str = "zh-TW") -> Tuple[str, int, str]:
+    """
+    直接调用 scripts/nikke_api.py，通过指定的 name_codes 拉取详情。
+    返回 (latest_path, http_status, stdout)
+    """
+    page_url = _auto_page_url(openid_b64 or "", "combat")
+    # 将 name_codes 拼为逗号分隔串
+    name_codes_arg = ",".join(str(int(x)) for x in name_codes if str(x).strip())
+
+    cmd = [
+        os.sys.executable,
+        API_SCRIPT,
+        "--intl-open-id", str(intl_open_id),
+        "--name-codes", name_codes_arg,
+        "--page-url", page_url,
+        "--cookie-file", cookie_file,
+        "--language", language,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out_b, err_b = await proc.communicate()
+    out = (out_b or b"").decode("utf-8", errors="ignore")
+    err = (err_b or b"").decode("utf-8", errors="ignore")
+    if proc.returncode != 0:
+        raise RuntimeError(f"指定 namecode 详情脚本执行失败(exit={proc.returncode}): {err or out}")
+
+    # 解析 latest.json 路径与状态码
+    m_latest = re.search(r"最近一次响应写入：([^\r\n]+)", out)
+    m_status = re.search(r"HTTP 状态码：(\d+)", out)
+    latest_path = m_latest.group(1).strip() if m_latest else ""
+    http_status = int(m_status.group(1)) if m_status else 0
+    return latest_path, http_status, out
+
+
+def _parse_name_codes_arg(text: str) -> List[int]:
+    """
+    解析用户输入的 namecode 列表（逗号或空格分隔），返回整数列表。
+    例如：'5155,5065 5138' → [5155, 5065, 5138]
+    """
+    if not text:
+        return []
+    items: List[int] = []
+    for seg in re.split(r"[,\s]+", str(text).strip()):
+        if not seg:
+            continue
+        try:
+            items.append(int(seg))
+        except Exception:
+            # 忽略不可解析项
+            continue
+    return items
 
 
 
@@ -1265,6 +1318,75 @@ class NikkePlugin(Star):
             # 未启用 AI：使用原有公式回复
             yield event.plain_result(text)
 
+    @nikke.command("namecode", alias={"指定", "角色", "codes"})
+    async def by_namecode(self, event: AstrMessageEvent, codes: str):
+        """
+        通过指定的 namecode 列表获取对应角色详情并汇总装备属性（Top3）。
+        用法示例：
+        - /nikke namecode 5155
+        - /nikke namecode 5155, 5065 5138
+        说明：
+        - 需要先 /nikke bind 绑定 openid 并配置有效 Cookie。
+        - 本命令将直接调用详情接口（GetUserCharacterDetails），只返回你指定的角色。
+        """
+        # 读取绑定
+        bindings = _load_bindings()
+        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
+        bind = bindings.get(key)
+        if not bind:
+            yield event.plain_result("尚未绑定。请先使用 /nikke bind <openid> 完成绑定。")
+            return
+
+        openid_b64 = bind.get("openid_base64") or ""
+        intl_open_id = bind.get("intl_open_id")
+        if not openid_b64 and intl_open_id:
+            try:
+                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
+            except Exception:
+                openid_b64 = ""
+
+        # 校验 Cookie
+        cookie_file = _resolve_cookie_path()
+        if not os.path.isfile(cookie_file):
+            yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
+            return
+
+        # 解析 namecode 参数
+        name_codes = _parse_name_codes_arg(codes)
+        if not name_codes:
+            yield event.plain_result("未解析到有效的 namecode。请以逗号或空格分隔输入，例如：/nikke namecode 5155,5065 5138")
+            return
+
+        # 执行详情抓取
+        try:
+            latest_path, status, runner_out = await _run_api_by_namecodes(
+                intl_open_id=str(intl_open_id),
+                openid_b64=str(openid_b64 or ""),
+                cookie_file=cookie_file,
+                name_codes=name_codes,
+                language="zh-TW",
+            )
+        except Exception as e:
+            logger.error(f"按 namecode 运行失败：{e}")
+            yield event.plain_result(f"查询失败：{e}")
+            return
+
+        # 汇总展示
+        summary = _summarize_from_latest(latest_path)
+
+        # 尝试用本地映射将 code → 名称，便于确认
+        names_map = _load_names_map()
+        pretty_targets = []
+        for c in name_codes:
+            key = str(c)
+            pretty_targets.append(f"{names_map.get(key, '未知')}({c})")
+        targets_text = "，".join(pretty_targets) if pretty_targets else ",".join(str(x) for x in name_codes)
+
+        text = (
+            f"已为您查询指定角色：{targets_text}\n"
+            f"{summary}"
+        )
+        yield event.plain_result(text)
     @nikke.command("unionraid", alias={"工会战", "raid", "会战"})
     async def unionraid(self, event: AstrMessageEvent):
         """

@@ -28,8 +28,6 @@ RUNNER_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_runner.py")
 RUNNER_UNION_RAID_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_union_raid.py")
 # 工会突袭成员出刀采集脚本
 RUNNER_UNION_MEMBERS_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_union_members.py")
-# 详情接口脚本
-API_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_api.py")
 # 名称映射文件与抓取脚本
 NAMES_MAP_PATH = os.path.join(STORAGE_DIR, "nikke_names_zh.json")
 NAMES_FETCHER_SCRIPT = os.path.join(PLUGIN_DIR, "scripts", "nikke_names_fetcher.py")
@@ -240,51 +238,6 @@ async def _run_runner(intl_open_id: str, openid_b64: str, cookie_file: str, type
     return json_path, csv_path, latest_path, http_status, out
 
 
-async def _run_api_by_namecodes(
-    intl_open_id: str,
-    openid_b64: str,
-    cookie_file: str,
-    name_codes: List[int],
-    type_: str = "combat",
-    language: str = "zh-TW",
-) -> Tuple[str, int, str]:
-    """
-    调用 scripts/nikke_api.py，仅针对指定 name_code 拉取角色详情。
-    返回 (latest_path, http_status, stdout)。
-    """
-    if not name_codes:
-        raise ValueError("name_codes 不能为空。")
-    page_url = _auto_page_url(openid_b64 or "", type_)
-    cmd = [
-        os.sys.executable,
-        API_SCRIPT,
-        "--intl-open-id",
-        str(intl_open_id),
-        "--name-codes",
-        ",".join(str(int(code)) for code in name_codes),
-        "--page-url",
-        page_url,
-        "--cookie-file",
-        cookie_file,
-        "--language",
-        language,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out_b, err_b = await proc.communicate()
-    out = (out_b or b"").decode("utf-8", errors="ignore")
-    err = (err_b or b"").decode("utf-8", errors="ignore")
-    if proc.returncode != 0:
-        raise RuntimeError(f"详情脚本执行失败(exit={proc.returncode}): {err or out}")
-
-    m_latest = re.search(r"最近一次响应写入：([^\r\n]+)", out)
-    m_status = re.search(r"HTTP 状态码：(\d+)", out)
-    latest_path = m_latest.group(1).strip() if m_latest else ""
-    http_status = int(m_status.group(1)) if m_status else 0
-    return latest_path, http_status, out
 
 
 def _summarize_from_latest(latest_path: str) -> str:
@@ -1311,127 +1264,6 @@ class NikkePlugin(Star):
         else:
             # 未启用 AI：使用原有公式回复
             yield event.plain_result(text)
-
-    @nikke.command("namecode", alias={"code", "角色详情", "nc"})
-    async def namecode(self, event: AstrMessageEvent, codes: str = "", *more: str, **kwargs: Any):
-        """
-        通过指定 name_code 查询角色详情（可一次查询多个，使用逗号或空格分隔）。
-        """
-        raw_segments: List[str] = []
-        raw_segments.append(codes)
-
-        raw_segments.extend([c for c in more if c is not None])
-
-        kw_codes = kwargs.get("codes")
-        if kw_codes:
-            if isinstance(kw_codes, (list, tuple, set)):
-                raw_segments.extend(str(x) for x in kw_codes if x is not None)
-            else:
-                raw_segments.append(str(kw_codes))
-
-        tokens: List[str] = []
-        for token in raw_segments:
-            token = (token or "").strip()
-            if not token:
-                continue
-            tokens.extend([p.strip() for p in re.split(r"[,\uFF0C]+", token) if p.strip()])
-        if not tokens:
-            yield event.plain_result("请提供至少一个 name_code，例如：/nikke namecode 5155 或 /nikke namecode 5155,5065")
-            return
-
-        name_codes: List[int] = []
-        for piece in tokens:
-            if not re.fullmatch(r"\d+", piece):
-                yield event.plain_result(f"非法 name_code：{piece}，请输入纯数字。")
-                return
-            try:
-                name_codes.append(int(piece))
-            except Exception:
-                yield event.plain_result(f"无法解析 name_code：{piece}")
-                return
-
-        bindings = _load_bindings()
-        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
-        bind = bindings.get(key)
-        if not bind:
-            yield event.plain_result("尚未绑定。请先使用 /nikke bind <openid> 完成绑定。")
-            return
-
-        openid_b64 = bind.get("openid_base64")
-        intl_open_id = bind.get("intl_open_id")
-        type_ = bind.get("type") or "combat"
-        if not intl_open_id:
-            yield event.plain_result("绑定信息缺少 intl_open_id，请重新绑定后再试。")
-            return
-
-        if not openid_b64 and intl_open_id:
-            try:
-                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
-            except Exception:
-                openid_b64 = ""
-
-        cookie_file = _resolve_cookie_path()
-        if not os.path.isfile(cookie_file):
-            yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
-            return
-
-        try:
-            latest_path, status, api_out = await _run_api_by_namecodes(
-                intl_open_id=str(intl_open_id),
-                openid_b64=str(openid_b64 or ""),
-                cookie_file=cookie_file,
-                name_codes=name_codes,
-                type_=type_,
-            )
-        except Exception as e:
-            logger.error(f"namecode 查询失败：{e}")
-            yield event.plain_result(f"查询失败：{e}")
-            return
-
-        if not latest_path:
-            yield event.plain_result("查询完成但未获取到详情文件，请稍后再试。")
-            return
-
-        summary = _summarize_from_latest(latest_path)
-        code_list_text = ", ".join(str(c) for c in name_codes)
-        text = (
-            f"已获取指定 name_code 角色详情（{code_list_text}）\n"
-            f"{summary}"
-        )
-
-        ai_cfg = (self.config or {}).get("ai_settings", {})
-        if ai_cfg.get("enable_ai_for_info", False):
-            try:
-                inj = build_info_system_prompt(self.config, summary)
-                self._ai_pending[event.session_id] = inj
-
-                conv = None
-                try:
-                    curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-                    if curr_cid:
-                        conv = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-                except Exception:
-                    conv = None
-                if conv is None:
-                    try:
-                        cid = await self.context.conversation_manager.new_conversation(
-                            event.unified_msg_origin, event.get_platform_id()
-                        )
-                        conv = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, cid)
-                    except Exception:
-                        conv = None
-
-                yield event.request_llm(
-                    prompt=str(ai_cfg.get("info_prompt", "请基于系统中追加的角色详情摘要进行说明。")),
-                    conversation=conv,
-                    session_id=event.session_id,
-                    func_tool_manager=self.context.get_llm_tool_manager(),
-                )
-                return
-            except Exception as e:
-                logger.error(f"namecode AI 回复失败：{e}")
-
-        yield event.plain_result(text)
 
     @nikke.command("unionraid", alias={"工会战", "raid", "会战"})
     async def unionraid(self, event: AstrMessageEvent):

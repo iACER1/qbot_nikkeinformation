@@ -1621,21 +1621,21 @@ class NikkePlugin(Star):
         # 完整装备词条展示
         summary = _summarize_full_equips(latest_path, prefer_lang="zh-tw")
 
-        # 目标确认文本：使用主展示名（优先简中，否则取第一个）
+        # 目标确认文本：使用主展示名（优先简中，否则取第一个），不附加 namecode
         pretty_targets = []
         for c in dedup_codes:
             key = str(c)
             raw = names_map.get(key, "")
             disp = _pick_primary_name(raw) if raw else "未知"
-            pretty_targets.append(f"{disp}({c})")
-        targets_text = "，".join(pretty_targets) if pretty_targets else ",".join(str(x) for x in dedup_codes)
+            pretty_targets.append(disp)
+        targets_text = "，".join(pretty_targets) if pretty_targets else ""
 
         extra = ""
         if not_found:
             extra = "\n未识别的名字/别名：" + "，".join(not_found)
 
         text = (
-            f"已为您查询指定角色：{targets_text}{extra}\n"
+            f"查询成功！{targets_text}{extra}\n"
             f"{summary}"
         )
         yield event.plain_result(text)

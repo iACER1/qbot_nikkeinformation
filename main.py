@@ -110,6 +110,8 @@ def _save_bindings(obj: Dict[str, Any]) -> None:
 def _load_names_map() -> Dict[str, str]:
     """
     读取中文名映射表 storage/nikke_names_zh.json；不存在则返回空。
+    文件的值支持“逗号分隔”的多名称（如：繁中,简中,别称1,别称2）。
+    返回：code(str) -> 原始字符串（保持文件内容，不拆分，以避免覆盖你手动维护的别称）。
     """
     try:
         with open(NAMES_MAP_PATH, "r", encoding="utf-8") as f:
@@ -120,6 +122,39 @@ def _load_names_map() -> Dict[str, str]:
     except Exception:
         pass
     return {}
+
+def _pick_primary_name(raw: str) -> str:
+    """
+    从“逗号分隔”的多名称字符串中挑选用于展示的主名称：
+    - 优先第2个（通常为简中），否则取第1个。
+    - 去除首尾空白。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    parts = [p.strip() for p in raw.split(",") if str(p).strip()]
+    if not parts:
+        return ""
+    if len(parts) >= 2:
+        return parts[1] or parts[0]
+    return parts[0]
+
+def _build_name_index(names_map: Dict[str, str]) -> Dict[str, str]:
+    """
+    基于 code->多名称字符串 构建一个 反向索引：名字(小写) -> code(str)
+    - 会拆分每个值的逗号分隔字段，全部纳入可匹配项；
+    - 去除前后空白，统一为小写用于匹配；
+    - 忽略空白项。
+    """
+    idx: Dict[str, str] = {}
+    for code, raw in (names_map or {}).items():
+        if not isinstance(raw, str):
+            continue
+        for token in raw.split(","):
+            name = str(token).strip()
+            if not name:
+                continue
+            idx[name.lower()] = str(code)
+    return idx
 
 def _decode_intl_open_id_from_b64(openid_b64: str) -> Optional[str]:
     """
@@ -428,7 +463,9 @@ def _summarize_from_latest(latest_path: str) -> str:
                 code_key = str(int(float(str(code))))
             except Exception:
                 code_key = str(code)
-            name = names_map.get(code_key, name)
+            mapped = names_map.get(code_key)
+            if mapped:
+                name = _pick_primary_name(mapped)
         pw = pick_power(ch)
         show_name = name if name else (f"未知角色({code})" if code else "未知角色")
         title = f"{idx}. {show_name}  战力：{pw if pw is not None else '未知'}"
@@ -613,7 +650,9 @@ def _summarize_full_equips(latest_path: str, prefer_lang: str = "zh-tw") -> str:
                 code_key = str(int(float(str(code))))
             except Exception:
                 code_key = str(code)
-            name = names_map.get(code_key, name)
+            mapped = names_map.get(code_key)
+            if mapped:
+                name = _pick_primary_name(mapped)
         pw = pick_power(ch)
         show_name = name if name else (f"未知角色({code})" if code else "未知角色")
         lines.append(f"{show_name}  战力：{pw if pw is not None else '未知'}")
@@ -1493,16 +1532,17 @@ class NikkePlugin(Star):
             # 未启用 AI：使用原有公式回复
             yield event.plain_result(text)
 
-    @nikke.command("namecode", alias={"指定", "角色", "codes"})
-    async def by_namecode(self, event: AstrMessageEvent, codes: str):
+    @nikke.command("name", alias={"角色", "名字", "别名"})
+    async def by_name(self, event: AstrMessageEvent, qname: str):
         """
-        通过指定的 namecode 列表获取对应角色详情并汇总装备属性（Top3）。
+        通过“角色名字/别名”（简中或繁中，或你手动添加的别称）获取对应角色详情并完整展示装备词条。
         用法示例：
-        - /nikke namecode 5155
-        - /nikke namecode 5155, 5065 5138
+        - /nikke name 水尼恩
+        - /nikke name 尼恩：蓝色海洋
+        - /nikke name 克雷伊, 皇冠   （支持以逗号/空格分隔多个）
         说明：
         - 需要先 /nikke bind 绑定 openid 并配置有效 Cookie。
-        - 本命令将直接调用详情接口（GetUserCharacterDetails），只返回你指定的角色。
+        - 本命令将直接调用详情接口，仅返回你指定的角色。
         """
         # 读取绑定
         bindings = _load_bindings()
@@ -1526,39 +1566,76 @@ class NikkePlugin(Star):
             yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
             return
 
-        # 解析 namecode 参数
-        name_codes = _parse_name_codes_arg(codes)
-        if not name_codes:
-            yield event.plain_result("未解析到有效的 namecode。请以逗号或空格分隔输入，例如：/nikke namecode 5155,5065 5138")
+        # 基于本地映射进行“名字/别名 → code”匹配
+        names_map = _load_names_map()
+        idx = _build_name_index(names_map)
+
+        # 支持多名字：逗号或空格分隔
+        tokens = [t.strip() for t in re.split(r"[,\s]+", str(qname).strip()) if t.strip()]
+        wanted_codes: List[int] = []
+        not_found: List[str] = []
+
+        for t in tokens:
+            key_lc = t.lower()
+            code_str = idx.get(key_lc)
+            if code_str is None:
+                not_found.append(t)
+                continue
+            try:
+                wanted_codes.append(int(code_str))
+            except Exception:
+                # 容错：若 code 不是整数形式，尝试直接加入字符串转 int（按失败处理）
+                try:
+                    wanted_codes.append(int(float(code_str)))
+                except Exception:
+                    not_found.append(t)
+
+        # 若一个都没匹配到，给出提示
+        if not wanted_codes:
+            hint = "未匹配到任何角色。请先使用 /nikke update_namelist 获取或补充映射，并确保已为该角色添加简中/别称。"
+            yield event.plain_result(hint)
             return
 
-        # 执行详情抓取
+        # 去重并保持原顺序
+        dedup_codes: List[int] = []
+        seen = set()
+        for c in wanted_codes:
+            if c not in seen:
+                seen.add(c)
+                dedup_codes.append(c)
+
+        # 执行详情抓取（语言优先 zh-TW，以保证字段一致性；展示时我们会处理为简洁名称）
         try:
             latest_path, status, runner_out = await _run_api_by_namecodes(
                 intl_open_id=str(intl_open_id),
                 openid_b64=str(openid_b64 or ""),
                 cookie_file=cookie_file,
-                name_codes=name_codes,
+                name_codes=dedup_codes,
                 language="zh-TW",
             )
         except Exception as e:
-            logger.error(f"按 namecode 运行失败：{e}")
+            logger.error(f"按 name 运行失败：{e}")
             yield event.plain_result(f"查询失败：{e}")
             return
 
-        # 汇总展示
+        # 完整装备词条展示
         summary = _summarize_full_equips(latest_path, prefer_lang="zh-tw")
 
-        # 尝试用本地映射将 code → 名称，便于确认
-        names_map = _load_names_map()
+        # 目标确认文本：使用主展示名（优先简中，否则取第一个）
         pretty_targets = []
-        for c in name_codes:
+        for c in dedup_codes:
             key = str(c)
-            pretty_targets.append(f"{names_map.get(key, '未知')}({c})")
-        targets_text = "，".join(pretty_targets) if pretty_targets else ",".join(str(x) for x in name_codes)
+            raw = names_map.get(key, "")
+            disp = _pick_primary_name(raw) if raw else "未知"
+            pretty_targets.append(f"{disp}({c})")
+        targets_text = "，".join(pretty_targets) if pretty_targets else ",".join(str(x) for x in dedup_codes)
+
+        extra = ""
+        if not_found:
+            extra = "\n未识别的名字/别名：" + "，".join(not_found)
 
         text = (
-            f"已为您查询指定角色：{targets_text}\n"
+            f"已为您查询指定角色：{targets_text}{extra}\n"
             f"{summary}"
         )
         yield event.plain_result(text)
@@ -1815,8 +1892,12 @@ class NikkePlugin(Star):
     async def update_namelist(self, event: AstrMessageEvent):
         """
         一键更新 NIKKE 名称映射（code→中文名）（管理员专用）。
-        无需参数，使用插件配置 names_updater.sources，若未配置则使用内置默认源。
-        结果写入 storage/nikke_names_zh.json。
+        新策略：仅“新增”新角色，不覆盖你对已有条目的手动修改（包括你添加的简中名与别称）。
+        流程：
+        1) 调用抓取脚本写入到临时文件；
+        2) 读取现有 storage/nikke_names_zh.json 与临时文件；
+        3) 仅把临时文件里的“新 code”追加进现有文件，保持原有键不变；
+        4) 覆写 storage/nikke_names_zh.json（仅新增的差异）。
         """
         try:
             ns_cfg = {}
@@ -1841,11 +1922,14 @@ class NikkePlugin(Star):
 
             _ensure_dir(STORAGE_DIR)
 
+            # 1) 先输出到临时文件，避免直接覆盖你的手动改动
+            temp_out = os.path.join(STORAGE_DIR, "nikke_names_zh.tmp.json")
+
             cmd = [
                 os.sys.executable,
                 NAMES_FETCHER_SCRIPT,
                 "--language", language,
-                "--out", NAMES_MAP_PATH,
+                "--out", temp_out,
             ]
             for u in sources:
                 cmd.extend(["--url", u])
@@ -1862,15 +1946,49 @@ class NikkePlugin(Star):
             if proc.returncode != 0:
                 raise RuntimeError(err or out or "抓取脚本执行失败")
 
-            m_stats = re.search(r"来源文件数：(\d+)，新增映射数：(\d+)，当前总映射键数：(\d+)", out)
-            stats_text = ""
-            if m_stats:
-                stats_text = f"来源：{m_stats.group(1)}；新增：{m_stats.group(2)}；总键数：{m_stats.group(3)}"
-            else:
-                stats_text = "抓取完成。"
+            # 2) 读取现有与新抓取
+            existing: Dict[str, str] = {}
+            try:
+                with open(NAMES_MAP_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        existing = {str(k): str(v) for k, v in data.items() if v is not None}
+            except Exception:
+                existing = {}
+
+            fetched: Dict[str, str] = {}
+            try:
+                with open(temp_out, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        fetched = {str(k): str(v) for k, v in data.items() if v is not None}
+            except Exception as e:
+                raise RuntimeError(f"读取临时抓取文件失败：{e}")
+
+            # 3) 仅追加“新 code”，不覆盖旧值
+            added = 0
+            for k, v in fetched.items():
+                if k not in existing:
+                    existing[k] = str(v)
+                    added += 1
+
+            # 4) 回写主文件
+            with open(NAMES_MAP_PATH, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+
+            # 可清理临时文件（忽略失败）
+            try:
+                os.remove(temp_out)
+            except Exception:
+                pass
+
+            # 统计信息：来源数从抓取脚本输出解析；新增数=added；总键数=len(existing)
+            m_src = re.search(r"来源文件数：(\d+)", out)
+            src_cnt = m_src.group(1) if m_src else "?"
+            stats_text = f"来源：{src_cnt}；新增：{added}；总键数：{len(existing)}"
 
             yield event.plain_result(
-                f"已更新名称映射（写入：{NAMES_MAP_PATH}）\n语言：{language}\n{stats_text}"
+                f"已更新名称映射（写入：{NAMES_MAP_PATH}）\n语言：{language}\n{stats_text}\n注意：已保留你对旧条目的手动修改，仅新增新角色。"
             )
         except Exception as e:
             logger.error(f"update_namelist 失败：{e}")

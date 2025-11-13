@@ -598,7 +598,7 @@ def _summarize_full_equips(latest_path: str, prefer_lang: str = "zh-tw") -> str:
 
     part_names = [
         ("head", "头部"),
-        ("torso", "胸部"),
+        ("torso", "胸甲"),
         ("arm", "手臂"),
         ("leg", "腿部"),
     ]
@@ -653,12 +653,7 @@ def _summarize_full_equips(latest_path: str, prefer_lang: str = "zh-tw") -> str:
                     grad = extract_grad(fd)
                     label = TYPE_LABELS.get(ftype, ftype)
                     val_text = format_value(float(val), str(vtype))
-                    # 展示样式：标签 值 (LvX) [id]
-                    show_id = fd.get("id")
-                    if show_id is None:
-                        lines.append(f"    · {label}：{val_text} (Lv{grad})")
-                    else:
-                        lines.append(f"    · {label}：{val_text} (Lv{grad}) [id={show_id}]")
+                    lines.append(f"    · {label}：{val_text}")
 
         # 角色间空行分隔
         lines.append("")

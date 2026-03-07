@@ -1,33 +1,4 @@
 {
-  "ai_settings": {
-    "description": "AI回复配置（/nikke bind 与 /nikke info）",
-    "type": "object",
-    "hint": "为绑定与信息查询两条指令提供可选的AI回复能力与可编辑提示词。提示词会在人格设定的system_prompt之后插入；info的摘要信息会紧随提示词之后插入。",
-    "items": {
-      "enable_ai_for_bind": {
-        "description": "启用 /nikke bind 的AI回复",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后，绑定成功后将额外向所选的LLM发送一个请求，由AI进行友好确认与引导。"
-      },
-      "enable_ai_for_info": {
-        "description": "启用 /nikke info 的AI回复",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后，完成抓取与摘要后，会额外向LLM发送请求，请AI进行分析与建议。"
-      },
-      "bind_prompt": {
-        "description": "bind 指令的AI提示词",
-        "type": "text",
-        "default": "你是 NIKKE 游戏的情报助理。\n请以简洁友好的语气进行确认，并提示下一步操作：\n- 告知可使用 /nikke info 获取战力前十详情\n- 如需 Cookie 或公开设置，请简要提醒\n注意：禁止输出路径或 URL。"
-      },
-      "info_prompt": {
-        "description": "info 指令的AI提示词",
-        "type": "text",
-        "default": "你是 NIKKE 装备与练度分析助手。\n基于后续提供的“战力前十详情摘要”，用中文给出结构化点评与建议：\n1) 账号整体强弱与风格\n2) 针对每个角色Top3词条给出一句优化建议\n3) 指出明显问题的优先改进方向\n输出简洁，避免无关信息。"
-      }
-    }
-  },
   "names_updater": {
     "description": "NIKKE 中文名映射更新配置（/nikke update_namelist）",
     "type": "object",

@@ -10,8 +10,6 @@ from typing import Optional, Tuple, Dict, Any, List
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
-from astrbot.api.provider import ProviderRequest
-from .ai_reply import build_bind_system_prompt, build_info_system_prompt
 
 # 存储路径（AstrBot 数据目录 data/plugin_data/qbot_nikkeinformation）
 PLUGIN_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -325,23 +323,6 @@ def _parse_name_codes_arg(text: str) -> List[int]:
             # 忽略不可解析项
             continue
     return items
-
-
-def _build_ai_hidden_contexts(text: str) -> List[Dict[str, Any]]:
-    """
-    构造仅供当前一次 LLM 请求使用的隐藏上下文：
-    - 作为内部 user 消息发送给模型；
-    - 通过 _no_save 标记避免写回会话历史；
-    - 从而实现“查询结果 + 提示词一起交给 AI”，但不在前端显示伪造的用户消息。
-    """
-    payload = str(text or "").strip()
-    if not payload:
-        return []
-    return [{
-        "role": "user",
-        "content": payload,
-        "_no_save": True,
-    }]
 
 
 def _summarize_from_latest(latest_path: str) -> str:
@@ -1380,8 +1361,6 @@ class NikkePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        # 仅在本插件触发的 AI 请求上进行 system_prompt 注入的标记：session_id -> injection_text
-        self._ai_pending: Dict[str, str] = {}
 
     @filter.command_group("nikke", alias={"妮姬", "nikkeinfo"})
     def nikke(self):
@@ -1419,44 +1398,7 @@ class NikkePlugin(Star):
             "type": "combat",
         }
         _save_bindings(bindings)
-        # 单一回复策略：启用 AI 时，不再发送公式回复，只发送一次 AI 回复；若 AI 失败则回退到公式回复
-        ai_cfg = (self.config or {}).get("ai_settings", {})
-        if ai_cfg.get("enable_ai_for_bind", False):
-            try:
-                inj = build_bind_system_prompt(self.config, str(intl_open_id), str(openid_b64 or ""))
-                hidden_contexts = _build_ai_hidden_contexts(inj)
-
-                # 获取/创建当前会话的 Conversation
-                conv = None
-                try:
-                    curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-                    if curr_cid:
-                        conv = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-                except Exception:
-                    conv = None
-                if conv is None:
-                    try:
-                        cid = await self.context.conversation_manager.new_conversation(
-                            event.unified_msg_origin, event.get_platform_id()
-                        )
-                        conv = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, cid)
-                    except Exception:
-                        conv = None
-
-                # 使用隐藏上下文把“绑定提示词”交给模型，但不写回会话历史，也不在前端显示伪造用户消息
-                yield ProviderRequest(
-                    prompt=None,
-                    contexts=hidden_contexts,
-                    conversation=conv,
-                    session_id=event.session_id,
-                )
-            except Exception as e:
-                logger.error(f"bind AI 回复失败：{e}")
-                # 回退为原始公式回复
-                yield event.plain_result(f"已绑定：intl_open_id={intl_open_id}；后续使用 /nikke info 即可查询。")
-        else:
-            # 未启用 AI：使用原有公式回复
-            yield event.plain_result(f"已绑定：intl_open_id={intl_open_id}；后续使用 /nikke info 即可查询。")
+        yield event.plain_result(f"已绑定：intl_open_id={intl_open_id}；后续使用 /nikke info 即可查询。")
 
     @nikke.command("info", alias={"查询"})
     async def info(self, event: AstrMessageEvent):
@@ -1504,49 +1446,11 @@ class NikkePlugin(Star):
             return
 
         summary = _summarize_from_latest(latest_path)
-        page_url = _auto_page_url(openid_b64 or "", type_)
         text = (
             f"已为您整理战力前十详情\n"
             f"{summary}"
         )
-        # 单一回复策略：启用 AI 时不再发送公式回复，只发送一次 AI 回复；若 AI 失败则回退到公式回复
-        ai_cfg = (self.config or {}).get("ai_settings", {})
-        if ai_cfg.get("enable_ai_for_info", False):
-            try:
-                inj = build_info_system_prompt(self.config, summary)
-                hidden_contexts = _build_ai_hidden_contexts(inj)
-
-                # 获取/创建当前会话的 Conversation
-                conv = None
-                try:
-                    curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-                    if curr_cid:
-                        conv = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-                except Exception:
-                    conv = None
-                if conv is None:
-                    try:
-                        cid = await self.context.conversation_manager.new_conversation(
-                            event.unified_msg_origin, event.get_platform_id()
-                        )
-                        conv = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, cid)
-                    except Exception:
-                        conv = None
-
-                # 使用隐藏上下文把“查询结果 + 分析提示词”一起交给模型，但不写回会话历史
-                yield ProviderRequest(
-                    prompt=None,
-                    contexts=hidden_contexts,
-                    conversation=conv,
-                    session_id=event.session_id,
-                )
-            except Exception as e:
-                logger.error(f"info AI 回复失败：{e}")
-                # 回退为原始公式回复
-                yield event.plain_result(text)
-        else:
-            # 未启用 AI：使用原有公式回复
-            yield event.plain_result(text)
+        yield event.plain_result(text)
 
     @nikke.command("name", alias={"角色", "名字", "别名"})
     async def by_name(self, event: AstrMessageEvent, qname: str):
@@ -2017,20 +1921,6 @@ class NikkePlugin(Star):
         except Exception as e:
             logger.error(f"update_namelist 失败：{e}")
             yield event.plain_result(f"更新映射失败：{e}")
-
-    @filter.on_llm_request(priority=-10)
-    async def ai_on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """
-        在请求 LLM 前注入 AI 提示词，插入位置：人格设定提示词之后。
-        仅处理本插件标记过的请求（通过 self._ai_pending 标记）。
-        """
-        try:
-            inj = self._ai_pending.pop(event.session_id, None)
-            if inj:
-                base = req.system_prompt or ""
-                req.system_prompt = f"{base}\n{inj}"
-        except Exception as e:
-            logger.error(f"Nikke 插件 on_llm_request 失败：{e}")
 
     async def terminate(self):
         """插件卸载时的清理（当前无需处理）。"""

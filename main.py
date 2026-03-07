@@ -327,19 +327,21 @@ def _parse_name_codes_arg(text: str) -> List[int]:
     return items
 
 
-def _build_ai_command_prompt(raw_text: str, fallback: str, keep_tokens: int = 2) -> str:
+def _build_ai_hidden_contexts(text: str) -> List[Dict[str, Any]]:
     """
-    构造用于插件 AI 请求的“用户提示”：
-    - 仅保留命令本身（默认前两个 token），避免把参数或插件提示词写入会话历史；
-    - 详细指令与查询结果统一通过 system_prompt 注入，避免出现“伪造 user 提示词”。
+    构造仅供当前一次 LLM 请求使用的隐藏上下文：
+    - 作为内部 user 消息发送给模型；
+    - 通过 _no_save 标记避免写回会话历史；
+    - 从而实现“查询结果 + 提示词一起交给 AI”，但不在前端显示伪造的用户消息。
     """
-    text = str(raw_text or "").strip()
-    if not text:
-        return fallback
-    parts = [seg for seg in re.split(r"\s+", text) if seg]
-    if not parts:
-        return fallback
-    return " ".join(parts[:keep_tokens]) or fallback
+    payload = str(text or "").strip()
+    if not payload:
+        return []
+    return [{
+        "role": "user",
+        "content": payload,
+        "_no_save": True,
+    }]
 
 
 def _summarize_from_latest(latest_path: str) -> str:
@@ -1422,7 +1424,7 @@ class NikkePlugin(Star):
         if ai_cfg.get("enable_ai_for_bind", False):
             try:
                 inj = build_bind_system_prompt(self.config, str(intl_open_id), str(openid_b64 or ""))
-                self._ai_pending[event.session_id] = inj
+                hidden_contexts = _build_ai_hidden_contexts(inj)
 
                 # 获取/创建当前会话的 Conversation
                 conv = None
@@ -1441,13 +1443,12 @@ class NikkePlugin(Star):
                     except Exception:
                         conv = None
 
-                llm_prompt = _build_ai_command_prompt(event.message_str, "/nikke bind")
-                # 仅触发一次 LLM 请求；prompt 仅保留命令本身，详细提示词通过 system_prompt 注入
-                yield event.request_llm(
-                    prompt=llm_prompt,
+                # 使用隐藏上下文把“绑定提示词”交给模型，但不写回会话历史，也不在前端显示伪造用户消息
+                yield ProviderRequest(
+                    prompt=None,
+                    contexts=hidden_contexts,
                     conversation=conv,
                     session_id=event.session_id,
-                    func_tool_manager=self.context.get_llm_tool_manager(),
                 )
             except Exception as e:
                 logger.error(f"bind AI 回复失败：{e}")
@@ -1513,7 +1514,7 @@ class NikkePlugin(Star):
         if ai_cfg.get("enable_ai_for_info", False):
             try:
                 inj = build_info_system_prompt(self.config, summary)
-                self._ai_pending[event.session_id] = inj
+                hidden_contexts = _build_ai_hidden_contexts(inj)
 
                 # 获取/创建当前会话的 Conversation
                 conv = None
@@ -1532,13 +1533,12 @@ class NikkePlugin(Star):
                     except Exception:
                         conv = None
 
-                llm_prompt = _build_ai_command_prompt(event.message_str, "/nikke info")
-                # 仅触发一次 LLM 请求；prompt 仅保留命令本身，分析提示词与摘要通过 system_prompt 注入
-                yield event.request_llm(
-                    prompt=llm_prompt,
+                # 使用隐藏上下文把“查询结果 + 分析提示词”一起交给模型，但不写回会话历史
+                yield ProviderRequest(
+                    prompt=None,
+                    contexts=hidden_contexts,
                     conversation=conv,
                     session_id=event.session_id,
-                    func_tool_manager=self.context.get_llm_tool_manager(),
                 )
             except Exception as e:
                 logger.error(f"info AI 回复失败：{e}")

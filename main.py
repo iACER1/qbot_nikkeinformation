@@ -327,6 +327,20 @@ def _parse_name_codes_arg(text: str) -> List[int]:
     return items
 
 
+def _build_ai_command_prompt(raw_text: str, fallback: str, keep_tokens: int = 2) -> str:
+    """
+    构造用于插件 AI 请求的“用户提示”：
+    - 仅保留命令本身（默认前两个 token），避免把参数或插件提示词写入会话历史；
+    - 详细指令与查询结果统一通过 system_prompt 注入，避免出现“伪造 user 提示词”。
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return fallback
+    parts = [seg for seg in re.split(r"\s+", text) if seg]
+    if not parts:
+        return fallback
+    return " ".join(parts[:keep_tokens]) or fallback
+
 
 def _summarize_from_latest(latest_path: str) -> str:
     """
@@ -1427,9 +1441,10 @@ class NikkePlugin(Star):
                     except Exception:
                         conv = None
 
-                # 仅触发一次 LLM 请求（system_prompt 注入在 on_llm_request 钩子中执行，且在人格提示词之后）
+                llm_prompt = _build_ai_command_prompt(event.message_str, "/nikke bind")
+                # 仅触发一次 LLM 请求；prompt 仅保留命令本身，详细提示词通过 system_prompt 注入
                 yield event.request_llm(
-                    prompt=str(ai_cfg.get("bind_prompt", "用户已完成 NIKKE 账户绑定，请进行确认并提示下一步操作。")),
+                    prompt=llm_prompt,
                     conversation=conv,
                     session_id=event.session_id,
                     func_tool_manager=self.context.get_llm_tool_manager(),
@@ -1517,9 +1532,10 @@ class NikkePlugin(Star):
                     except Exception:
                         conv = None
 
-                # 仅触发一次 LLM 请求（提示词插入在人格设定提示词之后；摘要位于可编辑提示词之后）
+                llm_prompt = _build_ai_command_prompt(event.message_str, "/nikke info")
+                # 仅触发一次 LLM 请求；prompt 仅保留命令本身，分析提示词与摘要通过 system_prompt 注入
                 yield event.request_llm(
-                    prompt=str(ai_cfg.get("info_prompt", "请基于系统中追加的战力前十详情摘要进行分析与建议回复。")),
+                    prompt=llm_prompt,
                     conversation=conv,
                     session_id=event.session_id,
                     func_tool_manager=self.context.get_llm_tool_manager(),
@@ -1892,12 +1908,11 @@ class NikkePlugin(Star):
     async def update_namelist(self, event: AstrMessageEvent):
         """
         一键更新 NIKKE 名称映射（code→中文名）（管理员专用）。
-        新策略：仅“新增”新角色，不覆盖你对已有条目的手动修改（包括你添加的简中名与别称）。
-        流程：
-        1) 调用抓取脚本写入到临时文件；
-        2) 读取现有 storage/nikke_names_zh.json 与临时文件；
-        3) 仅把临时文件里的“新 code”追加进现有文件，保持原有键不变；
-        4) 覆写 storage/nikke_names_zh.json（仅新增的差异）。
+
+        新策略：
+        1) 默认自动发现 Blablalink 当前版本正在使用的最新名称表 JSON；
+        2) 无需再手动去 DevTools 复制会变化的哈希 CDN 地址；
+        3) 仍然只“新增”新角色，不覆盖你对已有条目的手动修改（包括简中名与别称）。
         """
         try:
             ns_cfg = {}
@@ -1907,17 +1922,16 @@ class NikkePlugin(Star):
                 ns_cfg = {}
 
             sources = []
+            auto_discover = True
+            discover_home_url = "https://www.blablalink.com/"
+            language = "zh-CN"
+
             if isinstance(ns_cfg, dict):
                 v = ns_cfg.get("sources", [])
                 if isinstance(v, list):
                     sources = [str(x).strip() for x in v if str(x).strip()]
-            if not sources:
-                sources = [
-                    "https://sg-tools-cdn.blablalink.com/vm-36/bj-70/6223a9fbfd3be53b48587c934a91f686.json"
-                ]
-
-            language = "zh-CN"
-            if isinstance(ns_cfg, dict):
+                auto_discover = bool(ns_cfg.get("auto_discover", True))
+                discover_home_url = str(ns_cfg.get("discover_home_url", "https://www.blablalink.com/") or "https://www.blablalink.com/")
                 language = str(ns_cfg.get("language", "zh-CN") or "zh-CN")
 
             _ensure_dir(STORAGE_DIR)
@@ -1931,6 +1945,11 @@ class NikkePlugin(Star):
                 "--language", language,
                 "--out", temp_out,
             ]
+            if auto_discover:
+                cmd.extend([
+                    "--discover-auto",
+                    "--discover-home-url", discover_home_url,
+                ])
             for u in sources:
                 cmd.extend(["--url", u])
 
@@ -1985,10 +2004,15 @@ class NikkePlugin(Star):
             # 统计信息：来源数从抓取脚本输出解析；新增数=added；总键数=len(existing)
             m_src = re.search(r"来源文件数：(\d+)", out)
             src_cnt = m_src.group(1) if m_src else "?"
+            auto_text = "开启" if auto_discover else "关闭"
             stats_text = f"来源：{src_cnt}；新增：{added}；总键数：{len(existing)}"
 
             yield event.plain_result(
-                f"已更新名称映射（写入：{NAMES_MAP_PATH}）\n语言：{language}\n{stats_text}\n注意：已保留你对旧条目的手动修改，仅新增新角色。"
+                f"已更新名称映射（写入：{NAMES_MAP_PATH}）\n"
+                f"语言：{language}\n"
+                f"自动发现：{auto_text}\n"
+                f"{stats_text}\n"
+                f"注意：已保留你对旧条目的手动修改，仅新增新角色。"
             )
         except Exception as e:
             logger.error(f"update_namelist 失败：{e}")

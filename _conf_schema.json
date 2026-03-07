@@ -31,22 +31,32 @@
   "names_updater": {
     "description": "NIKKE 中文名映射更新配置（/nikke update_namelist）",
     "type": "object",
-    "hint": "配置默认的CDN JSON来源列表与语言。管理员可一键更新映射写入 storage/nikke_names_zh.json。",
+    "hint": "默认优先自动发现当前站点使用的最新名称 JSON，无需手动去 DevTools 复制哈希 CDN 地址；手动 sources 仍可作为补充或兜底。",
     "items": {
+      "auto_discover": {
+        "description": "自动发现最新 JSON",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，会从 Blablalink 首页与当前入口 JS 自动解析名称表逻辑路径，并换算为真实 CDN 地址。建议保持开启。"
+      },
+      "discover_home_url": {
+        "description": "自动发现入口页",
+        "type": "string",
+        "default": "https://www.blablalink.com/",
+        "hint": "用于抓取当前站点首页并解析入口 JS；通常无需修改。"
+      },
       "sources": {
-        "description": "CDN JSON 列表",
+        "description": "手动 JSON 源列表（可选）",
         "type": "list",
         "items_type": "string",
-        "default": [
-          "https://sg-tools-cdn.blablalink.com/vm-36/bj-70/6223a9fbfd3be53b48587c934a91f686.json"
-        ],
-        "hint": "从 DevTools 网络面板复制的 JSON 链接，可多项。"
+        "default": [],
+        "hint": "可选的手动补充/兜底来源；留空时将仅使用自动发现结果。"
       },
       "language": {
         "description": "抓取语言",
         "type": "string",
         "default": "zh-CN",
-        "hint": "用于 Accept-Language 与头部 x-language。"
+        "hint": "用于逻辑路径的语言占位符解析，以及请求头 Accept-Language。"
       }
     }
   }

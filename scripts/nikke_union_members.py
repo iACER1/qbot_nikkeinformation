@@ -70,6 +70,77 @@ def parse_cookie_to_dict(cookie_str: str) -> Dict[str, str]:
     return cookie_dict
 
 
+def format_cookie_dict(cookie_dict: Dict[str, str]) -> str:
+    return "; ".join(
+        f"{str(k).strip()}={str(v).strip()}"
+        for k, v in cookie_dict.items()
+        if str(k).strip() and v is not None and str(v).strip()
+    )
+
+
+def merge_response_cookies(
+    original_cookie_str: str,
+    session: requests.Session,
+    response: requests.Response,
+) -> Tuple[str, int]:
+    merged = parse_cookie_to_dict(original_cookie_str)
+    changed = 0
+
+    def upsert(name: str, value: str) -> None:
+        nonlocal changed
+        key = str(name or "").strip()
+        val = str(value or "").strip()
+        if not key:
+            return
+        if not val:
+            if key in merged:
+                del merged[key]
+                changed += 1
+            return
+        if merged.get(key) != val:
+            merged[key] = val
+            changed += 1
+
+    try:
+        for k, v in session.cookies.items():
+            upsert(k, v)
+    except Exception:
+        pass
+
+    try:
+        for k, v in response.cookies.items():
+            upsert(k, v)
+    except Exception:
+        pass
+
+    return format_cookie_dict(merged), changed
+
+
+def persist_response_cookies(
+    cookie_path: str,
+    original_cookie_str: str,
+    session: requests.Session,
+    response: requests.Response,
+) -> int:
+    merged_cookie_str, changed = merge_response_cookies(original_cookie_str, session, response)
+    if changed <= 0 or not merged_cookie_str:
+        return 0
+    ensure_dir(os.path.dirname(cookie_path) or ".")
+    with open(cookie_path, "w", encoding="utf-8") as f:
+        f.write(merged_cookie_str)
+    return changed
+
+
+def build_non_json_error(resp: requests.Response) -> str:
+    raw = resp.text or ""
+    snippet = re.sub(r"\s+", " ", raw).strip()[:200]
+    lowered = snippet.lower()
+    auth_markers = ("login", "sign in", "signin", "unauthorized", "forbidden", "access denied", "请登录", "登入", "登录")
+    if resp.status_code in (401, 403) or any(token in lowered for token in auth_markers):
+        return f"响应不是有效 JSON，疑似 Cookie 已失效、需要重新登录或请求被拦截（HTTP {resp.status_code}，响应片段：{snippet or '空'}）"
+    return f"响应不是有效 JSON（HTTP {resp.status_code}，响应片段：{snippet or '空'}）"
+
+
 def build_headers(
     cookie_str: str,
     page_url: str,
@@ -210,14 +281,22 @@ def main() -> None:
         max_retries=3,
     )
 
+    try:
+        cookie_updates = persist_response_cookies(cookie_path, cookie_str, session, resp)
+        if cookie_updates > 0:
+            print(f"[INFO] 已自动更新 Cookie：{cookie_path}（变更 {cookie_updates} 项）")
+    except Exception as e:
+        print(f"[WARN] 自动回写 Cookie 失败：{e}", file=sys.stderr)
+
     # 处理响应
     latest_path = os.path.join(STORAGE_DIR, "union_raid_members_latest.json")
 
     try:
         resp_json = resp.json()
     except ValueError:
-        print(f"HTTP 状态码：{resp.status_code}")
-        return
+        print(build_non_json_error(resp), file=sys.stderr)
+        print(f"HTTP 状态码：{resp.status_code}", file=sys.stderr)
+        sys.exit(3)
 
     with open(latest_path, "w", encoding="utf-8") as f:
         json.dump(resp_json, f, ensure_ascii=False, indent=2)

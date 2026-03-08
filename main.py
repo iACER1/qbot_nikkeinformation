@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger, AstrBotConfig
+from astrbot.api import logger, AstrBotConfig, llm_tool
 
 # 存储路径（AstrBot 数据目录 data/plugin_data/qbot_nikkeinformation）
 PLUGIN_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -1356,11 +1356,252 @@ def _build_union_members_template() -> str:
 </body>
 </html>
 """
-@register("nikkeinformation", "Apex", "NIKKE 信息查询（绑定 openid 后一键查询前十详情）", "1.1.0", "https://example.com/repo")
+@register("nikkeinformation", "Apex", "NIKKE 信息查询（支持命令与自然语言调用）", "1.2.0", "https://example.com/repo")
 class NikkePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+
+    def _build_binding_key(self, event: AstrMessageEvent) -> str:
+        return f"{event.get_platform_name()}:{event.get_sender_id()}"
+
+    def _get_bound_runtime(self, event: AstrMessageEvent) -> Tuple[Optional[Dict[str, Any]], str]:
+        bindings = _load_bindings()
+        bind = bindings.get(self._build_binding_key(event))
+        if not bind:
+            return None, "尚未绑定。请先使用 /nikke bind <openid> 完成绑定。"
+
+        openid_b64 = str(bind.get("openid_base64") or "").strip()
+        intl_open_id = str(bind.get("intl_open_id") or "").strip()
+        if not intl_open_id:
+            return None, "绑定信息缺少 intl_open_id，请重新使用 /nikke bind 绑定。"
+
+        if not openid_b64:
+            try:
+                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
+            except Exception:
+                openid_b64 = ""
+
+        cookie_file = _resolve_cookie_path()
+        if not os.path.isfile(cookie_file):
+            return None, f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。"
+
+        return {
+            "bind": bind,
+            "openid_b64": openid_b64,
+            "intl_open_id": intl_open_id,
+            "type": bind.get("type") or "combat",
+            "cookie_file": cookie_file,
+        }, ""
+
+    def _resolve_character_name_codes(self, qname: str) -> Tuple[List[int], List[str], List[str], Dict[str, str]]:
+        names_map = _load_names_map()
+        idx = _build_name_index(names_map)
+        tokens = [t.strip() for t in re.split(r"[,，、\s]+", str(qname).strip()) if t.strip()]
+
+        wanted_codes: List[int] = []
+        not_found: List[str] = []
+        for token in tokens:
+            code_str = idx.get(token.lower())
+            if code_str is None:
+                not_found.append(token)
+                continue
+            try:
+                wanted_codes.append(int(code_str))
+            except Exception:
+                try:
+                    wanted_codes.append(int(float(code_str)))
+                except Exception:
+                    not_found.append(token)
+
+        dedup_codes: List[int] = []
+        seen = set()
+        for code in wanted_codes:
+            if code in seen:
+                continue
+            seen.add(code)
+            dedup_codes.append(code)
+
+        pretty_targets: List[str] = []
+        for code in dedup_codes:
+            raw = names_map.get(str(code), "")
+            pretty_targets.append(_pick_primary_name(raw) if raw else f"角色{code}")
+
+        return dedup_codes, pretty_targets, not_found, names_map
+
+    async def _bind_openid_text(self, event: AstrMessageEvent, openid: str) -> str:
+        openid = str(openid or "").strip()
+        if not openid:
+            return "请输入有效的 openid。"
+
+        openid_b64 = None
+        intl_open_id = None
+        if "-" in openid or openid.isdigit():
+            if "-" in openid:
+                intl_open_id = openid.split("-", 1)[1]
+            else:
+                intl_open_id = openid
+        else:
+            openid_b64 = openid
+            intl_open_id = _decode_intl_open_id_from_b64(openid_b64)
+            if not intl_open_id:
+                return "无法从 Base64 openid 解码 intl_open_id，请检查输入。"
+
+        bindings = _load_bindings()
+        bindings[self._build_binding_key(event)] = {
+            "openid_base64": openid_b64,
+            "intl_open_id": str(intl_open_id),
+            "type": "combat",
+        }
+        _save_bindings(bindings)
+        return f"已绑定：intl_open_id={intl_open_id}；后续可直接让我帮你查询 NIKKE 信息，或继续使用 /nikke info。"
+
+    async def _query_bound_top10_text(self, event: AstrMessageEvent) -> str:
+        runtime, err = self._get_bound_runtime(event)
+        if err:
+            return err
+
+        try:
+            _, _, latest_path, _, _ = await _run_runner(
+                intl_open_id=str(runtime["intl_open_id"]),
+                openid_b64=str(runtime["openid_b64"]),
+                cookie_file=str(runtime["cookie_file"]),
+                type_=str(runtime["type"]),
+                top_n=10,
+            )
+        except Exception as e:
+            logger.error(f"LLM 查询前十失败：{e}")
+            return f"查询失败：{e}"
+
+        summary = _summarize_from_latest(latest_path)
+        return f"已为您整理战力前十详情\n{summary}"
+
+    async def _query_bound_character_text(self, event: AstrMessageEvent, qname: str) -> str:
+        runtime, err = self._get_bound_runtime(event)
+        if err:
+            return err
+
+        dedup_codes, pretty_targets, not_found, _ = self._resolve_character_name_codes(qname)
+        if not dedup_codes:
+            return "未匹配到任何角色。请先使用 /nikke update_namelist 获取或补充映射，并确保已为该角色添加简中/别称。"
+
+        try:
+            latest_path, _, _ = await _run_api_by_namecodes(
+                intl_open_id=str(runtime["intl_open_id"]),
+                openid_b64=str(runtime["openid_b64"]),
+                cookie_file=str(runtime["cookie_file"]),
+                name_codes=dedup_codes,
+                language="zh-TW",
+            )
+        except Exception as e:
+            logger.error(f"LLM 按角色名查询失败：{e}")
+            return f"查询失败：{e}"
+
+        summary = _summarize_full_equips(latest_path, prefer_lang="zh-tw")
+        extra = ""
+        if not_found:
+            extra = "\n未识别的名字/别名：" + "，".join(not_found)
+        targets_text = "，".join(pretty_targets) if pretty_targets else ""
+        return f"查询成功！{targets_text}{extra}\n{summary}"
+
+    async def _query_union_raid_text(self, event: AstrMessageEvent) -> str:
+        runtime, err = self._get_bound_runtime(event)
+        if err:
+            return err
+
+        try:
+            latest_path, _, _ = await _run_union_raid(
+                intl_open_id=str(runtime["intl_open_id"]),
+                openid_b64=str(runtime["openid_b64"]),
+                cookie_file=str(runtime["cookie_file"]),
+            )
+        except Exception as e:
+            logger.error(f"LLM 工会战查询失败：{e}")
+            return f"工会战查询失败：{e}"
+
+        items, err = _parse_union_raid(latest_path, prefer_lang="zh-tw")
+        if err:
+            return err
+        if not items:
+            return "未解析到任何 Boss 进度项。"
+
+        lines = [f"{it['name']}: {it['percent']}%  {it['current_fmt']} / {it['max_fmt']}" for it in items]
+        return "工会战 Boss 进度：\n" + "\n".join(lines)
+
+    async def _query_union_members_text(self, event: AstrMessageEvent) -> str:
+        runtime, err = self._get_bound_runtime(event)
+        if err:
+            return err
+
+        try:
+            latest_path, _, _ = await _run_union_raid_members(
+                intl_open_id=str(runtime["intl_open_id"]),
+                openid_b64=str(runtime["openid_b64"]),
+                cookie_file=str(runtime["cookie_file"]),
+            )
+        except Exception as e:
+            logger.error(f"LLM 工会成员出刀查询失败：{e}")
+            return f"出刀情况查询失败：{e}"
+
+        rows, err = _parse_union_raid_members(latest_path)
+        if err:
+            return err
+        if not rows:
+            return "未解析到任何成员出刀项。"
+
+        observed = [{"openid": r.get("openid", ""), "nickname": r.get("nickname", "")} for r in rows]
+        map_items = _init_union_members_map_if_missing(observed, max_slots=32)
+
+        disp = []
+        for r in rows:
+            member = _lookup_member_name(map_items, r.get("openid", ""), r.get("nickname", ""))
+            attempts = int(r.get("attempts") or 0)
+            total_damage = int(r.get("total_damage") or 0)
+            disp.append({
+                "member": member,
+                "attempts": attempts,
+                "total_damage": total_damage,
+                "total_fmt": _format_damage_b(total_damage),
+            })
+        disp.sort(key=lambda x: int(x["total_damage"]), reverse=True)
+
+        lines = ["联盟突袭出刀情况：", "No. | 成员 | 参与次数 | 总伤害"]
+        for i, d in enumerate(disp, start=1):
+            lines.append(f"{i} | {d['member']} | {d['attempts']} | {d['total_fmt']}")
+        return "\n".join(lines)
+
+    async def _query_union_missing_text(self, event: AstrMessageEvent) -> str:
+        runtime, err = self._get_bound_runtime(event)
+        if err:
+            return err
+
+        try:
+            latest_path, _, _ = await _run_union_raid_members(
+                intl_open_id=str(runtime["intl_open_id"]),
+                openid_b64=str(runtime["openid_b64"]),
+                cookie_file=str(runtime["cookie_file"]),
+            )
+        except Exception as e:
+            logger.error(f"LLM 未出刀查询失败：{e}")
+            return f"未出刀清单查询失败：{e}"
+
+        rows, err = _parse_union_raid_members(latest_path)
+        if err:
+            return err
+
+        map_items = _read_union_members_map()
+        if not map_items:
+            observed = [{"openid": r.get("openid", ""), "nickname": r.get("nickname", "")} for r in rows]
+            map_items = _init_union_members_map_if_missing(observed, max_slots=32)
+
+        unfilled = _compute_unfilled(map_items, rows, max_required=3)
+        if not unfilled:
+            return "全员已出满三刀。"
+
+        lines = ["未出刀/未出满三刀清单：", "No. | 成员 | 已出刀 | 剩余次数"]
+        for i, d in enumerate(unfilled, start=1):
+            lines.append(f"{i} | {d['member']} | {d['attempts']} | {d['remaining']}")
+        return "\n".join(lines)
 
     @filter.command_group("nikke", alias={"妮姬", "nikkeinfo"})
     def nikke(self):
@@ -1373,32 +1614,7 @@ class NikkePlugin(Star):
         绑定用户 openid（Base64 或 '29080-XXXXXXXX' 或纯数字 intl_open_id）。
         绑定后使用 /nikke info 即可查询。
         """
-        # 解析 openid
-        openid_b64 = None
-        intl_open_id = None
-        if "-" in openid or openid.isdigit():
-            # 可能是 '29080-XXXXXXXX' 或纯数字
-            if "-" in openid:
-                intl_open_id = openid.split("-", 1)[1]
-            else:
-                intl_open_id = openid
-        else:
-            openid_b64 = openid.strip()
-            intl_open_id = _decode_intl_open_id_from_b64(openid_b64)
-            if not intl_open_id:
-                yield event.plain_result("无法从 Base64 openid 解码 intl_open_id，请检查输入。")
-                return
-
-        # 保存绑定
-        bindings = _load_bindings()
-        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
-        bindings[key] = {
-            "openid_base64": openid_b64,
-            "intl_open_id": str(intl_open_id),
-            "type": "combat",
-        }
-        _save_bindings(bindings)
-        yield event.plain_result(f"已绑定：intl_open_id={intl_open_id}；后续使用 /nikke info 即可查询。")
+        yield event.plain_result(await self._bind_openid_text(event, openid))
 
     @nikke.command("info", alias={"查询"})
     async def info(self, event: AstrMessageEvent):
@@ -1406,51 +1622,7 @@ class NikkePlugin(Star):
         查询已绑定账户的战力前十详情。
         要求：插件数据目录 cookie.txt 存在且为有效登录态。
         """
-        # 读取绑定
-        bindings = _load_bindings()
-        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
-        bind = bindings.get(key)
-        if not bind:
-            yield event.plain_result("尚未绑定。请先使用 /nikke bind <openid> 完成绑定。")
-            return
-
-        openid_b64 = bind.get("openid_base64")
-        intl_open_id = bind.get("intl_open_id")
-        type_ = bind.get("type") or "combat"
-
-        # 若未保存 openid_base64，则根据 intl_open_id 构造一个 Base64("29080-<intl_open_id>")
-        if not openid_b64 and intl_open_id:
-            try:
-                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
-            except Exception:
-                openid_b64 = ""
-
-        # 校验 Cookie
-        cookie_file = _resolve_cookie_path()
-        if not os.path.isfile(cookie_file):
-            yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
-            return
-
-        # 执行后端
-        try:
-            json_path, csv_path, latest_path, status, runner_out = await _run_runner(
-                intl_open_id=str(intl_open_id),
-                openid_b64=str(openid_b64),
-                cookie_file=cookie_file,
-                type_=type_,
-                top_n=10,
-            )
-        except Exception as e:
-            logger.error(f"运行失败：{e}")
-            yield event.plain_result(f"查询失败：{e}")
-            return
-
-        summary = _summarize_from_latest(latest_path)
-        text = (
-            f"已为您整理战力前十详情\n"
-            f"{summary}"
-        )
-        yield event.plain_result(text)
+        yield event.plain_result(await self._query_bound_top10_text(event))
 
     @nikke.command("name", alias={"角色", "名字", "别名"})
     async def by_name(self, event: AstrMessageEvent, qname: str):
@@ -1464,101 +1636,7 @@ class NikkePlugin(Star):
         - 需要先 /nikke bind 绑定 openid 并配置有效 Cookie。
         - 本命令将直接调用详情接口，仅返回你指定的角色。
         """
-        # 读取绑定
-        bindings = _load_bindings()
-        key = f"{event.get_platform_name()}:{event.get_sender_id()}"
-        bind = bindings.get(key)
-        if not bind:
-            yield event.plain_result("尚未绑定。请先使用 /nikke bind <openid> 完成绑定。")
-            return
-
-        openid_b64 = bind.get("openid_base64") or ""
-        intl_open_id = bind.get("intl_open_id")
-        if not openid_b64 and intl_open_id:
-            try:
-                openid_b64 = base64.b64encode(f"29080-{intl_open_id}".encode("utf-8")).decode("ascii")
-            except Exception:
-                openid_b64 = ""
-
-        # 校验 Cookie
-        cookie_file = _resolve_cookie_path()
-        if not os.path.isfile(cookie_file):
-            yield event.plain_result(f"未找到 Cookie 文件：{cookie_file}。请将登录态写入该路径后再试。")
-            return
-
-        # 基于本地映射进行“名字/别名 → code”匹配
-        names_map = _load_names_map()
-        idx = _build_name_index(names_map)
-
-        # 支持多名字：逗号或空格分隔
-        tokens = [t.strip() for t in re.split(r"[,\s]+", str(qname).strip()) if t.strip()]
-        wanted_codes: List[int] = []
-        not_found: List[str] = []
-
-        for t in tokens:
-            key_lc = t.lower()
-            code_str = idx.get(key_lc)
-            if code_str is None:
-                not_found.append(t)
-                continue
-            try:
-                wanted_codes.append(int(code_str))
-            except Exception:
-                # 容错：若 code 不是整数形式，尝试直接加入字符串转 int（按失败处理）
-                try:
-                    wanted_codes.append(int(float(code_str)))
-                except Exception:
-                    not_found.append(t)
-
-        # 若一个都没匹配到，给出提示
-        if not wanted_codes:
-            hint = "未匹配到任何角色。请先使用 /nikke update_namelist 获取或补充映射，并确保已为该角色添加简中/别称。"
-            yield event.plain_result(hint)
-            return
-
-        # 去重并保持原顺序
-        dedup_codes: List[int] = []
-        seen = set()
-        for c in wanted_codes:
-            if c not in seen:
-                seen.add(c)
-                dedup_codes.append(c)
-
-        # 执行详情抓取（语言优先 zh-TW，以保证字段一致性；展示时我们会处理为简洁名称）
-        try:
-            latest_path, status, runner_out = await _run_api_by_namecodes(
-                intl_open_id=str(intl_open_id),
-                openid_b64=str(openid_b64 or ""),
-                cookie_file=cookie_file,
-                name_codes=dedup_codes,
-                language="zh-TW",
-            )
-        except Exception as e:
-            logger.error(f"按 name 运行失败：{e}")
-            yield event.plain_result(f"查询失败：{e}")
-            return
-
-        # 完整装备词条展示
-        summary = _summarize_full_equips(latest_path, prefer_lang="zh-tw")
-
-        # 目标确认文本：使用主展示名（优先简中，否则取第一个），不附加 namecode
-        pretty_targets = []
-        for c in dedup_codes:
-            key = str(c)
-            raw = names_map.get(key, "")
-            disp = _pick_primary_name(raw) if raw else "未知"
-            pretty_targets.append(disp)
-        targets_text = "，".join(pretty_targets) if pretty_targets else ""
-
-        extra = ""
-        if not_found:
-            extra = "\n未识别的名字/别名：" + "，".join(not_found)
-
-        text = (
-            f"查询成功！{targets_text}{extra}\n"
-            f"{summary}"
-        )
-        yield event.plain_result(text)
+        yield event.plain_result(await self._query_bound_character_text(event, qname))
     @nikke.command("unionraid", alias={"工会战", "raid", "会战"})
     async def unionraid(self, event: AstrMessageEvent):
         """
@@ -1921,6 +1999,62 @@ class NikkePlugin(Star):
         except Exception as e:
             logger.error(f"update_namelist 失败：{e}")
             yield event.plain_result(f"更新映射失败：{e}")
+
+    @llm_tool(name="nikke_bind_account")
+    async def llm_bind_account(self, event: AstrMessageEvent, openid: str) -> str:
+        """为当前用户绑定 NIKKE 查询账号。
+
+        当用户明确表达要绑定妮姬账号、设置 openid、关联自己的查询账号时调用此工具。
+        该工具只负责保存当前会话用户的绑定信息，不会自动查询角色数据。
+
+        Args:
+            openid(string): 用户提供的 openid，支持 Base64 openid、29080-XXXXXXXX 或纯数字 intl_open_id。
+        """
+        return await self._bind_openid_text(event, openid)
+
+    @llm_tool(name="nikke_query_bound_top10")
+    async def llm_query_bound_top10(self, event: AstrMessageEvent) -> str:
+        """查询用户已绑定 NIKKE 账号的战力前十角色详情。
+
+        当用户想查看自己的妮姬账号概况、战力前十、前十角色信息或主力角色概览时调用此工具。
+        """
+        return await self._query_bound_top10_text(event)
+
+    @llm_tool(name="nikke_query_character_detail")
+    async def llm_query_character_detail(self, event: AstrMessageEvent, character_names: str) -> str:
+        """查询用户已绑定 NIKKE 账号中指定角色的详情和完整装备词条。
+
+        当用户提到查看某个妮姬角色的信息、装备、词条、练度或角色详情时调用此工具。
+        如果用户给出的是别名、简中名、繁中名，也应优先调用此工具尝试匹配。
+
+        Args:
+            character_names(string): 要查询的角色名或别名，多个名字可用空格、逗号或顿号分隔。
+        """
+        return await self._query_bound_character_text(event, character_names)
+
+    @llm_tool(name="nikke_query_union_raid_progress")
+    async def llm_query_union_raid_progress(self, event: AstrMessageEvent) -> str:
+        """查询用户已绑定 NIKKE 账号所在工会的 Boss 进度。
+
+        当用户提到工会战、联盟突袭、Boss 血量、Boss 进度时调用此工具。
+        """
+        return await self._query_union_raid_text(event)
+
+    @llm_tool(name="nikke_query_union_members_attacks")
+    async def llm_query_union_members_attacks(self, event: AstrMessageEvent) -> str:
+        """查询用户已绑定 NIKKE 账号所在工会的成员出刀情况。
+
+        当用户提到刀表、出刀情况、成员伤害统计、谁打了多少刀时调用此工具。
+        """
+        return await self._query_union_members_text(event)
+
+    @llm_tool(name="nikke_query_union_missing_attacks")
+    async def llm_query_union_missing_attacks(self, event: AstrMessageEvent) -> str:
+        """查询用户已绑定 NIKKE 账号所在工会的未出刀或未出满三刀成员列表。
+
+        当用户提到谁没出刀、谁没满三刀、缺刀成员、未出刀清单时调用此工具。
+        """
+        return await self._query_union_missing_text(event)
 
     async def terminate(self):
         """插件卸载时的清理（当前无需处理）。"""

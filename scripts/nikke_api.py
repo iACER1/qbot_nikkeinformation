@@ -128,9 +128,7 @@ def persist_response_cookies(
     merged_cookie_str, changed = merge_response_cookies(original_cookie_str, session, response)
     if changed <= 0 or not merged_cookie_str:
         return 0
-    ensure_dir(os.path.dirname(cookie_path) or ".")
-    with open(cookie_path, "w", encoding="utf-8") as f:
-        f.write(merged_cookie_str)
+    atomic_write_text(cookie_path, merged_cookie_str)
     return changed
 
 
@@ -231,6 +229,87 @@ def build_output_path(
     prefix = sanitize_filename_component(out_prefix or "GetUserCharacterDetails")
     req = sanitize_filename_component(request_id or uuid.uuid4().hex)
     return os.path.join(storage_dir, f"{timestamp}_{req}_{prefix}.json")
+
+
+def atomic_write_text(path: str, content: str) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def atomic_write_json(path: str, obj: Any) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def cleanup_old_result_files(
+    storage_dir: str,
+    prefix: str,
+    *,
+    current_path: Optional[str] = None,
+    suffix: str = ".json",
+    keep: int = 20,
+    max_age_seconds: int = 72 * 3600,
+) -> int:
+    if not os.path.isdir(storage_dir):
+        return 0
+
+    prefix = sanitize_filename_component(prefix)
+    current_abs = os.path.abspath(current_path) if current_path else ""
+    now = time.time()
+    candidates: List[Tuple[float, str]] = []
+
+    for fn in os.listdir(storage_dir):
+        if not fn.endswith(f"_{prefix}{suffix}"):
+            continue
+        full = os.path.abspath(os.path.join(storage_dir, fn))
+        if current_abs and full == current_abs:
+            continue
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        candidates.append((mtime, full))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    keep = max(0, int(keep))
+    max_age_seconds = max(0, int(max_age_seconds))
+    to_delete: List[str] = []
+
+    for idx, (mtime, full) in enumerate(candidates):
+        overflow = keep == 0 or idx >= keep
+        too_old = max_age_seconds > 0 and (now - mtime) > max_age_seconds
+        if overflow or too_old:
+            to_delete.append(full)
+
+    removed = 0
+    for full in to_delete:
+        try:
+            os.remove(full)
+            removed += 1
+        except Exception:
+            pass
+    return removed
 
 
 def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
@@ -340,6 +419,8 @@ def main() -> None:
     parser.add_argument("--out-prefix", default="GetUserCharacterDetails", help="输出文件名前缀（用于自动生成独立结果文件名）")
     parser.add_argument("--request-id", default="", help="可选，请求标识；用于生成独立输出文件名")
     parser.add_argument("--out-path", default="", help="可选，指定本次响应 JSON 的输出路径；未指定则自动生成独立文件")
+    parser.add_argument("--retain-count", type=int, default=20, help="最多保留多少个同类结果文件（默认 20）")
+    parser.add_argument("--retain-hours", type=int, default=72, help="结果文件保留时长（小时，默认 72；传 0 表示不按时间删除）")
     args = parser.parse_args()
 
     ensure_dir(STORAGE_DIR)
@@ -416,12 +497,19 @@ def main() -> None:
         out_path=args.out_path,
         request_id=args.request_id,
     )
-    ensure_dir(os.path.dirname(output_path) or ".")
+    atomic_write_json(output_path, resp_json)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(resp_json, f, ensure_ascii=False, indent=2)
+    removed = cleanup_old_result_files(
+        storage_dir=STORAGE_DIR,
+        prefix=args.out_prefix,
+        current_path=output_path,
+        keep=args.retain_count,
+        max_age_seconds=args.retain_hours * 3600,
+    )
 
     print(f"最近一次响应写入：{output_path}")
+    if removed > 0:
+        print(f"[CLEANUP] 已清理旧结果文件：{removed} 个")
     print(f"HTTP 状态码：{resp.status_code}")
     # 如需速率限制或缓存，可在上层调用层控制（例如每 openid 每 ≥5 分钟仅请求一次）。
 

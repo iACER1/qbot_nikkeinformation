@@ -5,19 +5,21 @@ Nikke 工会战 Boss 进度采集（插件内直连接口）
 
 功能:
 - 直连 GetUnionRaidLevelInfo 接口，返回当前工会战 Boss 信息（名称、本血量、最大血量等）
-- 将响应写入插件 storage 目录下的 union_raid_latest.json
-- 控制台输出摘要，供上层插件解析（HTTP 状态码与 latest 路径）
+- 将响应写入插件 storage 目录下的“本次请求独立结果文件”
+- 控制台输出摘要，供上层插件解析（HTTP 状态码与结果路径）
 
 合规提示:
 - 请确保你对目标账号拥有授权，且抓取频率合理（建议每用户 ≥ 5 分钟），避免影响站点服务。
 """
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
 import sys
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -125,9 +127,7 @@ def persist_response_cookies(
     merged_cookie_str, changed = merge_response_cookies(original_cookie_str, session, response)
     if changed <= 0 or not merged_cookie_str:
         return 0
-    ensure_dir(os.path.dirname(cookie_path) or ".")
-    with open(cookie_path, "w", encoding="utf-8") as f:
-        f.write(merged_cookie_str)
+    atomic_write_text(cookie_path, merged_cookie_str)
     return changed
 
 
@@ -193,6 +193,108 @@ def build_headers(
     return headers
 
 
+def sanitize_filename_component(value: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "request"
+
+
+def build_output_path(
+    storage_dir: str,
+    out_prefix: str,
+    out_path: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> str:
+    if out_path:
+        return os.path.abspath(out_path)
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    prefix = sanitize_filename_component(out_prefix or "union_raid_latest")
+    req = sanitize_filename_component(request_id or uuid.uuid4().hex)
+    return os.path.join(storage_dir, f"{timestamp}_{req}_{prefix}.json")
+
+
+def atomic_write_text(path: str, content: str) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def atomic_write_json(path: str, obj: Any) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def cleanup_old_result_files(
+    storage_dir: str,
+    prefix: str,
+    *,
+    current_path: Optional[str] = None,
+    suffix: str = ".json",
+    keep: int = 20,
+    max_age_seconds: int = 72 * 3600,
+) -> int:
+    if not os.path.isdir(storage_dir):
+        return 0
+
+    prefix = sanitize_filename_component(prefix)
+    current_abs = os.path.abspath(current_path) if current_path else ""
+    legacy_name = f"{prefix}{suffix}"
+    now = time.time()
+    candidates: List[Tuple[float, str]] = []
+
+    for fn in os.listdir(storage_dir):
+        if not (fn == legacy_name or fn.endswith(f"_{prefix}{suffix}")):
+            continue
+        full = os.path.abspath(os.path.join(storage_dir, fn))
+        if current_abs and full == current_abs:
+            continue
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        candidates.append((mtime, full))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    keep = max(0, int(keep))
+    max_age_seconds = max(0, int(max_age_seconds))
+    to_delete: List[str] = []
+
+    for idx, (mtime, full) in enumerate(candidates):
+        overflow = keep == 0 or idx >= keep
+        too_old = max_age_seconds > 0 and (now - mtime) > max_age_seconds
+        if overflow or too_old:
+            to_delete.append(full)
+
+    removed = 0
+    for full in to_delete:
+        try:
+            os.remove(full)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+
 def exponential_backoff_request(
     method: str,
     url: str,
@@ -233,6 +335,11 @@ def main() -> None:
     parser.add_argument("--page-url", required=True, help="页面 URL（用于 x-common-params.data_statistics_page_id）")
     parser.add_argument("--cookie-file", default=COOKIE_DEFAULT, help="Cookie 文件路径（默认：插件数据目录 cookie.txt）")
     parser.add_argument("--extra-header", action="append", default=[], help='附加头部，格式 "Key=Value"，可重复传入')
+    parser.add_argument("--out-prefix", default="union_raid_latest", help="输出文件名前缀（默认 union_raid_latest）")
+    parser.add_argument("--request-id", default="", help="可选，请求标识；用于生成独立输出文件名")
+    parser.add_argument("--out-path", default="", help="可选，指定本次响应 JSON 的输出路径；未指定则自动生成独立文件")
+    parser.add_argument("--retain-count", type=int, default=20, help="最多保留多少个同类结果文件（默认 20）")
+    parser.add_argument("--retain-hours", type=int, default=72, help="结果文件保留时长（小时，默认 72；传 0 表示不按时间删除）")
     args = parser.parse_args()
 
     ensure_dir(STORAGE_DIR)
@@ -288,9 +395,6 @@ def main() -> None:
     except Exception as e:
         print(f"[WARN] 自动回写 Cookie 失败：{e}", file=sys.stderr)
 
-    # 处理响应
-    latest_path = os.path.join(STORAGE_DIR, "union_raid_latest.json")
-
     try:
         resp_json = resp.json()
     except ValueError:
@@ -298,11 +402,26 @@ def main() -> None:
         print(f"HTTP 状态码：{resp.status_code}", file=sys.stderr)
         sys.exit(3)
 
-    with open(latest_path, "w", encoding="utf-8") as f:
-        json.dump(resp_json, f, ensure_ascii=False, indent=2)
+    output_path = build_output_path(
+        storage_dir=STORAGE_DIR,
+        out_prefix=args.out_prefix,
+        out_path=args.out_path,
+        request_id=args.request_id,
+    )
+    atomic_write_json(output_path, resp_json)
+
+    removed = cleanup_old_result_files(
+        storage_dir=STORAGE_DIR,
+        prefix=args.out_prefix,
+        current_path=output_path,
+        keep=args.retain_count,
+        max_age_seconds=args.retain_hours * 3600,
+    )
 
     # 控制台摘要，供上层解析
-    print(f"union_raid_latest.json：{latest_path}")
+    print(f"union_raid_latest.json：{output_path}")
+    if removed > 0:
+        print(f"[CLEANUP] 已清理旧结果文件：{removed} 个")
     print(f"HTTP 状态码：{resp.status_code}")
 
 

@@ -274,7 +274,7 @@ async def _run_runner(intl_open_id: str, openid_b64: str, cookie_file: str, type
 async def _run_api_by_namecodes(intl_open_id: str, openid_b64: str, cookie_file: str, name_codes: List[int], language: str = "zh-TW") -> Tuple[str, int, str]:
     """
     直接调用 scripts/nikke_api.py，通过指定的 name_codes 拉取详情。
-    返回 (latest_path, http_status, stdout)
+    返回 (result_path, http_status, stdout)
     """
     page_url = _auto_page_url(openid_b64 or "", "combat")
     # 将 name_codes 拼为逗号分隔串
@@ -298,12 +298,12 @@ async def _run_api_by_namecodes(intl_open_id: str, openid_b64: str, cookie_file:
     if proc.returncode != 0:
         raise RuntimeError(f"指定 namecode 详情脚本执行失败(exit={proc.returncode}): {err or out}")
 
-    # 解析 latest.json 路径与状态码
-    m_latest = re.search(r"最近一次响应写入：([^\r\n]+)", out)
+    # 解析本次请求独立结果文件路径与状态码
+    m_result = re.search(r"最近一次响应写入：([^\r\n]+)", out)
     m_status = re.search(r"HTTP 状态码：(\d+)", out)
-    latest_path = m_latest.group(1).strip() if m_latest else ""
+    result_path = m_result.group(1).strip() if m_result else ""
     http_status = int(m_status.group(1)) if m_status else 0
-    return latest_path, http_status, out
+    return result_path, http_status, out
 
 
 def _parse_name_codes_arg(text: str) -> List[int]:
@@ -1476,7 +1476,7 @@ class NikkePlugin(Star):
         summary = _summarize_from_latest(latest_path)
         return f"已为您整理战力前十详情\n{summary}"
 
-    async def _query_bound_character_text(self, event: AstrMessageEvent, qname: str) -> str:
+    async def _query_bound_character_text(self, event: AstrMessageEvent, qname: str, source: str = "unknown") -> str:
         runtime, err = self._get_bound_runtime(event)
         if err:
             return err
@@ -1485,8 +1485,15 @@ class NikkePlugin(Star):
         if not dedup_codes:
             return "未匹配到任何角色。请先使用 /nikke update_namelist 获取或补充映射，并确保已为该角色添加简中/别称。"
 
+        logger.info(
+            f"NIKKE 单角色查询开始 source={source} "
+            f"platform={event.get_platform_name()} sender_id={event.get_sender_id()} "
+            f"umo={event.unified_msg_origin} intl_open_id={runtime['intl_open_id']} "
+            f"qname={qname!r} name_codes={dedup_codes}"
+        )
+
         try:
-            latest_path, _, _ = await _run_api_by_namecodes(
+            result_path, _, _ = await _run_api_by_namecodes(
                 intl_open_id=str(runtime["intl_open_id"]),
                 openid_b64=str(runtime["openid_b64"]),
                 cookie_file=str(runtime["cookie_file"]),
@@ -1494,10 +1501,15 @@ class NikkePlugin(Star):
                 language="zh-TW",
             )
         except Exception as e:
-            logger.error(f"LLM 按角色名查询失败：{e}")
+            logger.error(f"NIKKE 单角色查询失败 source={source} qname={qname!r} error={e}")
             return f"查询失败：{e}"
 
-        summary = _summarize_full_equips(latest_path, prefer_lang="zh-tw")
+        logger.info(
+            f"NIKKE 单角色查询完成 source={source} "
+            f"result_path={result_path} name_codes={dedup_codes}"
+        )
+
+        summary = _summarize_full_equips(result_path, prefer_lang="zh-tw")
         extra = ""
         if not_found:
             extra = "\n未识别的名字/别名：" + "，".join(not_found)
@@ -1636,7 +1648,7 @@ class NikkePlugin(Star):
         - 需要先 /nikke bind 绑定 openid 并配置有效 Cookie。
         - 本命令将直接调用详情接口，仅返回你指定的角色。
         """
-        yield event.plain_result(await self._query_bound_character_text(event, qname))
+        yield event.plain_result(await self._query_bound_character_text(event, qname, source="command:/nikke name"))
     @nikke.command("unionraid", alias={"工会战", "raid", "会战"})
     async def unionraid(self, event: AstrMessageEvent):
         """
@@ -2030,7 +2042,7 @@ class NikkePlugin(Star):
         Args:
             character_names(string): 要查询的角色名或别名，多个名字可用空格、逗号或顿号分隔。
         """
-        return await self._query_bound_character_text(event, character_names)
+        return await self._query_bound_character_text(event, character_names, source="llm_tool:nikke_query_character_detail")
 
     @llm_tool(name="nikke_query_union_raid_progress")
     async def llm_query_union_raid_progress(self, event: AstrMessageEvent) -> str:

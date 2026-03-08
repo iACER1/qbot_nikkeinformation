@@ -6,7 +6,7 @@ Nikke API 练度采集（插件内直连接口）
 功能概述：
 - 直连接口获取用户角色详情数据。
 - 支持通过 Cookie 或参数提供 intl_open_id、name_codes。
-- 输出最近一次响应 latest.json 与 HTTP 状态码。
+- 每次请求写入独立响应文件，并向上层返回该文件路径与 HTTP 状态码。
 
 合规：
 - 请确保你对目标账号拥有授权，并设置合理抓取频率（建议每用户 ≥ 5 分钟）。
@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -212,6 +213,26 @@ def parse_name_codes(text: str) -> List[int]:
     return items
 
 
+def sanitize_filename_component(value: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "request"
+
+
+def build_output_path(
+    storage_dir: str,
+    out_prefix: str,
+    out_path: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> str:
+    if out_path:
+        return os.path.abspath(out_path)
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    prefix = sanitize_filename_component(out_prefix or "GetUserCharacterDetails")
+    req = sanitize_filename_component(request_id or uuid.uuid4().hex)
+    return os.path.join(storage_dir, f"{timestamp}_{req}_{prefix}.json")
+
+
 def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
     """
     扁平化嵌套字典，方便 CSV 导出。
@@ -316,7 +337,9 @@ def main() -> None:
     parser.add_argument("--page-url", required=True, help="页面 URL（用于 x-common-params.data_statistics_page_id）")
     parser.add_argument("--cookie-file", default=COOKIE_DEFAULT, help="Cookie 文件路径（默认：插件数据目录 cookie.txt）")
     parser.add_argument("--extra-header", action="append", default=[], help='附加头部，格式 "Key=Value"，可重复传入')
-    parser.add_argument("--out-prefix", default="GetUserCharacterDetails", help="输出文件名前缀")
+    parser.add_argument("--out-prefix", default="GetUserCharacterDetails", help="输出文件名前缀（用于自动生成独立结果文件名）")
+    parser.add_argument("--request-id", default="", help="可选，请求标识；用于生成独立输出文件名")
+    parser.add_argument("--out-path", default="", help="可选，指定本次响应 JSON 的输出路径；未指定则自动生成独立文件")
     args = parser.parse_args()
 
     ensure_dir(STORAGE_DIR)
@@ -378,9 +401,6 @@ def main() -> None:
     except Exception as e:
         print(f"[WARN] 自动回写 Cookie 失败：{e}", file=sys.stderr)
 
-    # 处理响应
-    latest_path = os.path.join(STORAGE_DIR, "latest.json")
-
     # 尝试解析为 JSON
     try:
         resp_json = resp.json()
@@ -389,11 +409,19 @@ def main() -> None:
         print(f"HTTP 状态码：{resp.status_code}", file=sys.stderr)
         sys.exit(3)
 
-    # 仅写入 latest.json，避免每次查询生成冗余文件
-    with open(latest_path, "w", encoding="utf-8") as f:
+    # 为本次请求生成独立结果文件，避免相邻/并发请求互相覆盖
+    output_path = build_output_path(
+        storage_dir=STORAGE_DIR,
+        out_prefix=args.out_prefix,
+        out_path=args.out_path,
+        request_id=args.request_id,
+    )
+    ensure_dir(os.path.dirname(output_path) or ".")
+
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(resp_json, f, ensure_ascii=False, indent=2)
 
-    print(f"最近一次响应写入：{latest_path}")
+    print(f"最近一次响应写入：{output_path}")
     print(f"HTTP 状态码：{resp.status_code}")
     # 如需速率限制或缓存，可在上层调用层控制（例如每 openid 每 ≥5 分钟仅请求一次）。
 
